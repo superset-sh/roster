@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { fakeChatUrl } from "../test/fake-chat";
 import { runSessionsInThisProcess } from "./sessions/dispatch";
 import { hasDatabase, makeFixture } from "../test/fixtures";
 
@@ -20,20 +21,23 @@ vi.mock("@roster/superset", async (importOriginal) => {
       id: "workspace-1",
       path: "/tmp/workspace-1",
     })),
-    runAgent: vi.fn(async () => ({ sessionId: "terminal-1" })),
-    readTranscript: vi.fn(async () => ({
-      terminalId: "terminal-1",
-      text: "",
-      source: "harness" as const,
-      streamBytes: 0,
+    createChatSession: vi.fn(async () => ({
+      sessionId: `chat-${randomUUID()}`,
+      epoch: "epoch-1",
     })),
-    listAgentBindings: vi.fn(async () => []),
+    promptChat: vi.fn(async () => ({ itemId: randomUUID(), queued: false })),
+    getChatSession: vi.fn(async () => ({ session: null, cursor: null, live: true })),
+    cancelChatTurn: vi.fn(async () => undefined),
+    closeChatSession: vi.fn(async () => undefined),
+    chatStreamUrl: vi.fn((args: { sessionId: string }) => fakeChatUrl(args.sessionId)),
     deleteWorkspace: vi.fn(async () => undefined),
-    clearWorkspaceStatuses: vi.fn(async () => undefined),
-    interruptAgent: vi.fn(async () => undefined),
-    sendToAgent: vi.fn(async () => undefined),
   };
 });
+
+vi.mock("./sessions/connection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sessions/connection")>()),
+  jwtForMember: vi.fn(async () => ({ jwt: "jwt" })),
+}));
 
 async function connectSuperset(memberId: string, supersetOrgId: string) {
   const { db, members } = await import("@roster/db");
@@ -181,6 +185,13 @@ describe.skipIf(!hasDatabase())("a delegated run", () => {
     expect(child?.runAsMemberId).toBe(owner.memberId);
     expect(child?.error).toBeNull();
     expect(child?.status).toBe("running");
+
+    const { jwtForMember } = await import("./sessions/connection");
+    await vi.waitFor(() =>
+      expect(vi.mocked(jwtForMember)).toHaveBeenCalledWith(
+        expect.objectContaining({ memberId: owner.memberId }),
+      ),
+    );
 
     expect(await sessionOf(parent.threadId, fixture.agentFor())).toMatchObject({
       status: "waiting",

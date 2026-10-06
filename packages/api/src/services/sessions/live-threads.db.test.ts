@@ -138,7 +138,7 @@ describe.skipIf(!hasDatabase())("listLiveThreads", () => {
       runAsMemberId: fixture.memberId,
       status: "running",
       supersetWorkspaceId: "workspace-2",
-      supersetTerminalId: `terminal-sub-${made.threadId}`,
+      supersetChatSessionId: `chat-sub-${made.threadId}`,
       supersetHostKey: "host-1",
     });
 

@@ -6,6 +6,7 @@ import {
   assertReaped,
   cancelThread,
   completeThread,
+  countOpenWorktrees,
   listChannelThreads,
   listInboxThreads,
   listLiveThreads,
@@ -38,6 +39,14 @@ export const threadsRouter = createTRPCRouter({
 
   live: memberProcedure.query(({ ctx }) =>
     listLiveThreads({
+      organizationId: ctx.organizationId,
+      memberId: ctx.member.id,
+      role: ctx.member.role,
+    }),
+  ),
+
+  openWorktrees: memberProcedure.query(({ ctx }) =>
+    countOpenWorktrees({
       organizationId: ctx.organizationId,
       memberId: ctx.member.id,
       role: ctx.member.role,

@@ -82,10 +82,12 @@ export {
   listInboxThreads,
   listLiveThreads,
   threadDetail,
+  threadSummary,
   THREAD_STATUSES,
   type ChannelThread,
   type InboxThread,
   type LiveThread,
+  type ThreadBackgroundWork,
   type ThreadDetail,
   type ThreadStatus,
   type ThreadSummary,
@@ -129,11 +131,6 @@ export {
   type LinkRefusal,
 } from "./services/invite-links";
 export {
-  authorizeTerminalStream,
-  listWorktrees,
-  type Worktree,
-} from "./services/terminals";
-export {
   normalizeTaskStatus,
   TASK_STATUSES,
   TASK_STATUS_ORDER,
@@ -153,4 +150,23 @@ export type {
   SupersetHost,
   SupersetOrganization,
   SupersetProject,
+} from "@roster/superset";
+export {
+  authorizeChatStream,
+  listThreadChats,
+  type ThreadChat,
+} from "./services/chat";
+export type {
+  ChatApprovalRequest,
+  ChatBackgroundTask,
+  ChatCursor,
+  ChatDurableEnvelope,
+  ChatEnvelope,
+  ChatItem,
+  ChatPlan,
+  ChatSessionState,
+  ChatToolCall,
+  ChatToolContent,
+  ChatTurn,
+  ChatUserContent,
 } from "@roster/superset";

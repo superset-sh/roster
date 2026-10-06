@@ -8,29 +8,10 @@ export {
 } from "./crypto";
 export { decodeJwtClaims, type SupersetClaims } from "./jwt";
 export {
-  clearWorkspaceStatuses,
-  createTerminal,
   createWorkspace,
-  DEFAULT_AGENT,
   deleteWorkspace,
-  eventsUrl,
-  interruptAgent,
-  isAgentLifecycle,
-  killTerminal,
-  listHostAgents,
-  listTerminals,
-  readTranscript,
   routingKey,
-  runAgent,
-  sendToAgent,
-  terminalSocketUrl,
-  writeTerminalInput,
-  type AgentLifecycleEvent,
-  type AgentRun,
   type CreatedWorkspace,
-  type HostAgent,
-  type TerminalSession,
-  type Transcript,
 } from "./agents";
 export {
   getOrganization,
@@ -46,7 +27,20 @@ export {
   type SupersetSession,
 } from "./client";
 export {
-  bindingIsIdle,
-  listAgentBindings,
-  type AgentBinding,
-} from "./agents";
+  CHAT_STREAM_DELTAS,
+  ChatCallError,
+  cancelChatTurn,
+  chatStreamUrl,
+  closeChatSession,
+  createChatSession,
+  DEFAULT_CHAT_HARNESS,
+  getChatItems,
+  getChatSession,
+  promptChat,
+  respondToChatApproval,
+  stopChatBackgroundTask,
+  type ChatHost,
+  type ChatItemsPage,
+  type ChatSessionRow,
+} from "./chat";
+export * from "./chat-protocol";

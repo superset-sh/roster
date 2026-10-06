@@ -53,6 +53,16 @@ export interface WaitingOn {
   task: string;
 }
 
+export interface ThreadBackgroundWork {
+  rosterSessionId: string;
+  id: string;
+  kind: "process" | "subagent";
+  name: string;
+  detail?: string;
+  canStop: boolean;
+  startedAtMs: number;
+}
+
 export interface ThreadSummary {
   id: string;
   projectId: string;
@@ -71,6 +81,7 @@ export interface ThreadSummary {
   waitingOn: WaitingOn[];
   completedAt: Date | null;
   completedByMemberId: string | null;
+  backgroundWork: ThreadBackgroundWork[];
 }
 
 const THREAD_ID = sql.raw(`"roster"."threads"."id"`);
@@ -301,16 +312,49 @@ interface ThreadExtras {
   replies: Map<string, ReplyStats>;
   leads: Map<string, LeadSession>;
   waiting: Map<string, WaitingOn[]>;
+  background: Map<string, ThreadBackgroundWork[]>;
+}
+
+export async function backgroundWorkByThread(
+  threadIds: string[],
+): Promise<Map<string, ThreadBackgroundWork[]>> {
+  const found = new Map<string, ThreadBackgroundWork[]>();
+  if (threadIds.length === 0) return found;
+
+  const rows = await db
+    .select({
+      id: threadSessions.id,
+      threadId: threadSessions.threadId,
+      tasks: threadSessions.backgroundTasks,
+    })
+    .from(threadSessions)
+    .where(
+      and(
+        inArray(threadSessions.threadId, threadIds),
+        sql`jsonb_array_length(${threadSessions.backgroundTasks}) > 0`,
+      ),
+    );
+
+  for (const row of rows) {
+    const work = found.get(row.threadId) ?? [];
+    for (const task of row.tasks ?? []) {
+      work.push({ rosterSessionId: row.id, ...task });
+    }
+    found.set(row.threadId, work);
+  }
+
+  return found;
 }
 
 async function threadExtras(threadIds: string[]): Promise<ThreadExtras> {
-  const [replies, leads, waiting] = await Promise.all([
+  const [replies, leads, waiting, background] = await Promise.all([
     replyStatsByThread(threadIds),
     leadSessionByThread(threadIds),
     waitingOnByParent(threadIds),
+    backgroundWorkByThread(threadIds),
   ]);
 
-  return { replies, leads, waiting };
+  return { replies, leads, waiting, background };
 }
 
 function toSummary(row: SummaryRow, extras: ThreadExtras): ThreadSummary {
@@ -335,6 +379,7 @@ function toSummary(row: SummaryRow, extras: ThreadExtras): ThreadSummary {
     lastReplyAt: replies.lastReplyAt,
     replierNames: replies.replierNames,
     waitingOn: extras.waiting.get(row.id) ?? [],
+    backgroundWork: extras.background.get(row.id) ?? [],
   };
 }
 
@@ -629,6 +674,7 @@ export interface ThreadPublishState {
   waitingOn: WaitingOn[];
   completedAt: Date | null;
   completedByMemberId: string | null;
+  backgroundWork: ThreadBackgroundWork[];
 }
 
 export async function threadPublishState(
@@ -648,9 +694,10 @@ export async function threadPublishState(
 
   if (!row) return null;
 
-  const [leads, waiting] = await Promise.all([
+  const [leads, waiting, background] = await Promise.all([
     leadSessionByThread([row.id]),
     waitingOnByParent([row.id]),
+    backgroundWorkByThread([row.id]),
   ]);
   const lead = leads.get(row.id) ?? NO_SESSION;
 
@@ -666,6 +713,7 @@ export async function threadPublishState(
     waitingOn: waiting.get(row.id) ?? [],
     completedAt: asDate(row.completedAt),
     completedByMemberId: row.completedByMemberId,
+    backgroundWork: background.get(row.id) ?? [],
   };
 }
 
@@ -824,4 +872,25 @@ function threadMessageRows(conditions: SQL[], limit?: number) {
   return limit === undefined
     ? query.orderBy(asc(messages.seq))
     : query.orderBy(desc(messages.seq)).limit(limit);
+}
+
+export async function countOpenWorktrees(scope: {
+  organizationId: string;
+  memberId: string;
+  role: string;
+}): Promise<number> {
+  const rows = await db
+    .select({ workspaceId: threadSessions.supersetWorkspaceId })
+    .from(threadSessions)
+    .innerJoin(projects, eq(threadSessions.projectId, projects.id))
+    .where(
+      and(
+        eq(projects.organizationId, scope.organizationId),
+        visibleToMember(scope.memberId, scope.role),
+        isNull(threadSessions.workspaceReapedAt),
+        isNotNull(threadSessions.supersetWorkspaceId),
+      ),
+    );
+
+  return new Set(rows.map((row) => row.workspaceId)).size;
 }

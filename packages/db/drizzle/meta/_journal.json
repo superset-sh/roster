@@ -141,6 +141,13 @@
       "when": 1790797203691,
       "tag": "0019_ask_more_than_one_agent",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790797204691,
+      "tag": "0020_chat_sessions",
+      "breakpoints": true
     }
   ]
 }

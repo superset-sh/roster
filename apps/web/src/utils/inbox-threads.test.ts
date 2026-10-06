@@ -19,6 +19,7 @@ function thread(over: Partial<InboxThread> = {}): InboxThread {
     id: "t1",
     projectId: "p1",
     rootMessageId: "m1",
+    backgroundWork: [],
     status: "completed",
     lastProgress: null,
     error: null,

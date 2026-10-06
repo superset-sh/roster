@@ -153,6 +153,7 @@ const row = (thread: Partial<ThreadItem> = {}): ThreadItem => ({
   projectId: "channel-1",
   rootMessageId: "message-1",
   status: "idle",
+  backgroundWork: [],
   lastProgress: null,
   error: null,
   startedAt: new Date("2026-09-18T09:00:00.000Z"),

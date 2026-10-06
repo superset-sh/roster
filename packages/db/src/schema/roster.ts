@@ -327,15 +327,18 @@ export const threadSessions = rosterSchema.table(
     }),
 
     supersetWorkspaceId: text("superset_workspace_id"),
-    supersetTerminalId: text("superset_terminal_id"),
     supersetHostKey: text("superset_host_key"),
+    supersetChatSessionId: text("superset_chat_session_id"),
+    supersetHarnessSessionId: text("superset_harness_session_id"),
+    chatCursor: text("chat_cursor"),
+    backgroundTasks: jsonb("background_tasks")
+      .$type<ThreadBackgroundTask[]>()
+      .default(sql`'[]'::jsonb`)
+      .notNull(),
 
     status: text("status").default("starting").notNull(),
 
     lastProgress: text("last_progress"),
-    transcriptOffset: bigint("transcript_offset", { mode: "number" })
-      .default(0)
-      .notNull(),
 
     startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
     endedAt: timestamp("ended_at", { withTimezone: true }),
@@ -353,6 +356,15 @@ export const threadSessions = rosterSchema.table(
     index("thread_sessions_status_idx").on(table.status),
   ],
 );
+
+export interface ThreadBackgroundTask {
+  id: string;
+  kind: "process" | "subagent";
+  name: string;
+  detail?: string;
+  canStop: boolean;
+  startedAtMs: number;
+}
 
 export type SelectThreadSession = typeof threadSessions.$inferSelect;
 export type InsertThreadSession = typeof threadSessions.$inferInsert;
