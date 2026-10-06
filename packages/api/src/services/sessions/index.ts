@@ -12,6 +12,7 @@ export {
 export {
   cancelThread,
   ensureStarted,
+  stopSessions,
   joinThread,
   reapThread,
   retryThread,

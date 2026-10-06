@@ -9,6 +9,7 @@ import { trpc } from "~/utils/trpc";
 export type ChatConnection = "connecting" | "open" | "unavailable";
 
 const MAX_FAILED_CONNECTS = 3;
+const UNAVAILABLE_RETRY_MS = 15_000;
 
 export function useThreadChat(args: {
   orgSlug: string;
@@ -51,13 +52,11 @@ export function useThreadChat(args: {
       let opened = false;
       source = new EventSource(`/api/chat/stream?${query.toString()}`);
 
-      source.addEventListener("open", () => {
-        opened = true;
-        failures = 0;
-        setConnection("open");
-      });
+      source.addEventListener("ready", () => setConnection("open"));
 
       source.onmessage = (event: MessageEvent<string>) => {
+        opened = true;
+        failures = 0;
         let envelope: ChatEnvelope;
         try {
           envelope = JSON.parse(event.data) as ChatEnvelope;
@@ -73,12 +72,9 @@ export function useThreadChat(args: {
         source = null;
         if (disposed) return;
         failures = opened ? 0 : failures + 1;
-        if (failures >= MAX_FAILED_CONNECTS) {
-          setConnection("unavailable");
-          return;
-        }
-        setConnection("connecting");
-        retry = setTimeout(connect, Math.min(1000 * 2 ** failures, 10_000));
+        if (failures >= MAX_FAILED_CONNECTS) setConnection("unavailable");
+        else setConnection("connecting");
+        retry = setTimeout(connect, Math.min(1000 * 2 ** failures, UNAVAILABLE_RETRY_MS));
       };
     };
 

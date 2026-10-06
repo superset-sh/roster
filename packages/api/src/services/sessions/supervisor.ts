@@ -14,6 +14,7 @@ import {
 import {
   cancelChatTurn,
   ChatCallError,
+  getChatItems,
   type ChatApprovalRequest,
   type ChatBackgroundTask,
   type ChatCursor,
@@ -393,8 +394,7 @@ export async function endTurn(
   });
 }
 
-const CURSOR_WRITE_INTERVAL_MS = 5000;
-const AFFIRMATIVE = /^\s*(y|yes|yep|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\b/i;
+const AFFIRMATIVE = /^\s*(y|yes|yep|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\s*[.!]?\s*$/i;
 
 interface ChatWatch {
   sessionId: string;
@@ -404,12 +404,12 @@ interface ChatWatch {
   workspaceId: string;
   chatSessionId: string;
   socket: WebSocket | null;
+  jwt: string | null;
   attempts: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restTimer: ReturnType<typeof setTimeout> | null;
   stopped: boolean;
   cursor: ChatCursor | null;
-  cursorWrittenAt: number;
   turnId: string | null;
   startedTurns: Set<string>;
   replies: Map<string, string>;
@@ -457,12 +457,12 @@ function startChatWatch(args: {
     workspaceId: args.workspaceId,
     chatSessionId: args.chatSessionId,
     socket: null,
+    jwt: null,
     attempts: 0,
     retryTimer: null,
     restTimer: null,
     stopped: false,
     cursor: since,
-    cursorWrittenAt: 0,
     turnId: null,
     startedTurns: new Set(),
     replies: new Map(),
@@ -491,19 +491,21 @@ function connectChatWatch(watch: ChatWatch): void {
         hostKey: watch.hostKey,
       });
     } catch (cause) {
-      auth = {
-        jwt: null,
-        problem: humanSessionError(cause, {
-          fallback: "Could not sign in to Superset to reach that machine.",
-        }),
-      };
+      console.warn(
+        `[sessions] could not mint a Superset token for ${watch.sessionId}: ${sessionErrorDetail(cause)}`,
+      );
+      if (!watch.stopped) scheduleChatRetry(watch);
+      return;
     }
     if (watch.stopped) return;
     if (auth.jwt === null) {
-      stopChatWatch(watch.sessionId);
-      await finish({ sessionId: watch.sessionId, status: "failed", error: auth.problem });
+      await giveUpChatWatch(watch, auth.problem);
       return;
     }
+    watch.jwt = auth.jwt;
+
+    if (watch.cursor) await seedPendingApprovals(watch);
+    if (watch.stopped) return;
 
     let socket: WebSocket;
     try {
@@ -522,23 +524,23 @@ function connectChatWatch(watch: ChatWatch): void {
     }
     watch.socket = socket;
 
-    socket.onopen = () => {
-      watch.attempts = 0;
-    };
-
     socket.onmessage = (event) => {
       if (watch.socket !== socket) return;
       const envelope = parseChatEnvelope(String(event.data));
       if (!envelope) return;
+      watch.attempts = 0;
       if (isResetChatEnvelope(envelope)) {
         watch.cursor = null;
         if (envelope.reset.reason === "session_not_found") {
+          stopChatWatch(watch.sessionId);
           void finish({
             sessionId: watch.sessionId,
             status: "failed",
             error: "The agent session is gone from that machine.",
           });
+          return;
         }
+        socket.close();
         return;
       }
       if (isDeltaChatEnvelope(envelope)) {
@@ -548,15 +550,18 @@ function connectChatWatch(watch: ChatWatch): void {
       if (!isDurableChatEnvelope(envelope)) return;
       const { cursor, event: chatEvent } = envelope;
       const handled = watch.queue.then(async () => {
+        if (watch.socket !== socket) return;
         try {
           await handleChatEvent(watch, chatEvent);
         } catch (cause) {
           console.warn(
             `[sessions] chat event failed for ${watch.sessionId}: ${sessionErrorDetail(cause)}`,
           );
+          socket.close();
+          return;
         }
         watch.cursor = cursor;
-        await saveChatCursor(watch, true);
+        await saveChatCursor(watch);
       });
       watch.queue = handled;
       chatEventsInFlight.add(handled);
@@ -577,12 +582,7 @@ function scheduleChatRetry(watch: ChatWatch): void {
   if (watch.stopped || chatWatches.get(watch.sessionId) !== watch) return;
 
   if (watch.attempts >= MAX_ATTEMPTS) {
-    stopChatWatch(watch.sessionId);
-    void finish({
-      sessionId: watch.sessionId,
-      status: "failed",
-      error: "That machine is offline — Roster stopped waiting for it.",
-    });
+    void giveUpChatWatch(watch, "That machine is offline — Roster stopped waiting for it.");
     return;
   }
 
@@ -592,6 +592,62 @@ function scheduleChatRetry(watch: ChatWatch): void {
     watch.retryTimer = null;
     if (!watch.stopped) connectChatWatch(watch);
   }, delay);
+}
+
+/**
+ * Only a session in the middle of a turn has failed when its machine goes
+ * quiet. An idle or parked one already said what it had to say.
+ */
+async function giveUpChatWatch(watch: ChatWatch, reason: string): Promise<void> {
+  stopChatWatch(watch.sessionId);
+  const session = await sessionById(watch.sessionId);
+  if (!session || isTerminal(session.status)) return;
+  if (isIdle(session.status) || isParked(session.status)) {
+    const row = await patch(watch.sessionId, { backgroundTasks: [] });
+    if (row) await publishThread(row.threadId);
+    return;
+  }
+  await finish({ sessionId: watch.sessionId, status: "failed", error: reason });
+}
+
+async function latestChatItems(watch: ChatWatch) {
+  if (!watch.jwt) return [];
+  const page = await getChatItems({
+    jwt: watch.jwt,
+    routingKey: watch.hostKey,
+    sessionId: watch.chatSessionId,
+    limit: 200,
+  }).catch(() => null);
+  if (!page?.ok) return [];
+  return page.envelopes.flatMap((envelope) =>
+    envelope.event.type === "item"
+      ? [{ item: envelope.event.item, turnId: envelope.event.turnId }]
+      : [],
+  );
+}
+
+async function seedPendingApprovals(watch: ChatWatch): Promise<void> {
+  const latest = new Map<string, ChatApprovalRequest>();
+  for (const { item } of await latestChatItems(watch)) {
+    if (item.kind === "approval_request") latest.set(item.id, item);
+  }
+  for (const item of latest.values()) {
+    if (item.status === "pending") watch.pendingApprovals.set(item.id, item);
+  }
+}
+
+async function recoverReply(watch: ChatWatch, turnId: string): Promise<string | null> {
+  let reply: string | null = null;
+  for (const entry of await latestChatItems(watch)) {
+    if (
+      entry.turnId === turnId &&
+      entry.item.kind === "agent_message" &&
+      entry.item.text.trim().length > 0
+    ) {
+      reply = entry.item.text;
+    }
+  }
+  return reply;
 }
 
 function stopChatWatch(sessionId: string): void {
@@ -607,7 +663,7 @@ function stopChatWatch(sessionId: string): void {
     socket?.close();
   } catch {}
   chatWatches.delete(sessionId);
-  void saveChatCursor(watch, true);
+  void saveChatCursor(watch);
 }
 
 function restChatWatch(watch: ChatWatch): void {
@@ -622,11 +678,8 @@ function activateChatWatch(watch: ChatWatch): void {
   watch.restTimer = null;
 }
 
-async function saveChatCursor(watch: ChatWatch, force = false): Promise<void> {
+async function saveChatCursor(watch: ChatWatch): Promise<void> {
   if (!watch.cursor) return;
-  const now = Date.now();
-  if (!force && now - watch.cursorWrittenAt < CURSOR_WRITE_INTERVAL_MS) return;
-  watch.cursorWrittenAt = now;
   await db
     .update(threadSessions)
     .set({ chatCursor: serializeChatCursor(watch.cursor) })
@@ -709,8 +762,9 @@ async function handleChatEvent(
     }
     if (watch.turnId === turn.id) watch.turnId = null;
     const seen = watch.startedTurns.delete(turn.id);
-    if (!seen && (turn.completedAtMs ?? turn.startedAtMs) <= turn.startedAtMs) return;
-    watch.lastReply = watch.replies.get(turn.id) ?? null;
+    const instant = (turn.completedAtMs ?? turn.startedAtMs) <= turn.startedAtMs;
+    if (!seen && instant && turn.status === "completed") return;
+    watch.lastReply = watch.replies.get(turn.id) ?? (await recoverReply(watch, turn.id));
     watch.replies.delete(turn.id);
     watch.pendingApprovals.clear();
 
@@ -1402,7 +1456,7 @@ async function startChatSession(args: {
 
   await promptChat({ ...host, sessionId: created.sessionId, text: args.prompt });
 
-  const running = await patch(session.id, { status: "running", error: null });
+  const running = await patchLive(session.id, { status: "running", error: null });
   if (running) await publishThread(running.threadId);
 
   await drainSteers(session.id);
@@ -1779,6 +1833,26 @@ export async function retryThread(args: {
   return true;
 }
 
+/**
+ * A session started before threads ran on chat has no chat to watch. Its turn
+ * is over as far as Roster can tell; a reply starts a chat in its worktree.
+ */
+async function strandedTerminalSession(row: SessionView): Promise<void> {
+  const parked = await patchLive(row.id, {
+    status: "idle",
+    endedAt: new Date(),
+    lastProgress: null,
+    error: "This session ran in a terminal before Roster moved to chat. Reply to continue it.",
+  });
+  if (parked) await publishThread(parked.threadId);
+}
+
+export function stopAllChatWatches(): void {
+  for (const sessionId of [...chatWatches.keys()]) stopChatWatch(sessionId);
+  started = false;
+  starting = null;
+}
+
 export function ensureStarted(): Promise<void> {
   if (started) return Promise.resolve();
   if (starting) return starting;
@@ -1799,13 +1873,13 @@ export function ensureStarted(): Promise<void> {
       );
     started = true;
     for (const row of rows) {
-      if (
-        !row.supersetChatSessionId ||
-        !row.supersetWorkspaceId ||
-        !row.supersetHostKey
-      ) {
+      if (!row.supersetChatSessionId) {
+        if (row.status !== "idle" && row.supersetWorkspaceId) {
+          await strandedTerminalSession(row);
+        }
         continue;
       }
+      if (!row.supersetWorkspaceId || !row.supersetHostKey) continue;
 
       if (!row.runAsMemberId) {
         await finish({ sessionId: row.id, status: "failed", error: NO_MEMBER });
@@ -1822,6 +1896,8 @@ export function ensureStarted(): Promise<void> {
         since: parseChatCursor(row.chatCursor),
         harnessSessionId: row.supersetHarnessSessionId,
       });
+      const watch = chatWatches.get(row.id);
+      if (watch && row.status === "idle") restChatWatch(watch);
     }
   })().catch(() => {
     started = true;

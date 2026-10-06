@@ -30,6 +30,8 @@ export async function GET(request: Request): Promise<Response> {
 
   const encoder = new TextEncoder();
 
+  let shutdown = () => {};
+
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       let closed = false;
@@ -40,13 +42,13 @@ export async function GET(request: Request): Promise<Response> {
         try {
           controller.enqueue(encoder.encode(chunk));
         } catch {
-          closed = true;
+          shutdown();
         }
       };
 
       const keepalive = setInterval(() => write(": keepalive\n\n"), KEEPALIVE_MS);
 
-      const shutdown = () => {
+      shutdown = () => {
         if (closed) return;
         clearInterval(keepalive);
         closed = true;
@@ -59,7 +61,7 @@ export async function GET(request: Request): Promise<Response> {
       };
 
       socket.onopen = () => {
-        write(`event: open\ndata: ${JSON.stringify({ chatSessionId: target.chatSessionId })}\n\n`);
+        write(`event: ready\ndata: ${JSON.stringify({ chatSessionId: target.chatSessionId })}\n\n`);
       };
 
       socket.onmessage = (event: MessageEvent) => {
@@ -70,7 +72,10 @@ export async function GET(request: Request): Promise<Response> {
       socket.onerror = () => shutdown();
       socket.onclose = () => shutdown();
 
-      request.signal.addEventListener("abort", shutdown);
+      request.signal.addEventListener("abort", () => shutdown());
+    },
+    cancel() {
+      shutdown();
     },
   });
 

@@ -18,6 +18,7 @@ import {
   runSessionsInThisProcess,
   startSession,
   steer,
+  stopSessions,
 } from "@roster/api/sessions";
 
 import { sweepWorker } from "./sweep-worker";
@@ -87,6 +88,7 @@ async function standDown(): Promise<void> {
   sweeper = null;
   if (sweeping) await sweeping.close();
   if (running) await running.close();
+  stopSessions();
 }
 
 function scheduleClaim(): void {

@@ -11,6 +11,10 @@ export function sessionsRunHere(): boolean {
   return here;
 }
 
+export function stopSessions(): void {
+  if (here) supervisor.stopAllChatWatches();
+}
+
 export function ensureStarted(): Promise<void> {
   if (!here) return Promise.resolve();
   return supervisor.ensureStarted();

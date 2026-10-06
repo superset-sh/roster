@@ -140,7 +140,6 @@ export async function cancelChatTurn(
       commandId: randomUUID(),
       sessionId: host.sessionId,
       turnId: host.turnId,
-      pauseQueue: true,
     },
     what: "Stopping the agent",
     method: "POST",
