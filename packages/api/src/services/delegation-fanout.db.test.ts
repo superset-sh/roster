@@ -95,7 +95,7 @@ describe.skipIf(!hasDatabase())("asking two agents at once", () => {
     expect(parked?.status).toBe("waiting");
     expect(parked?.lastProgress).toBe("Waiting on @alpha and @beta…");
 
-    vi.mocked(superset.sendToAgent).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     await delegations.settleDelegationFor({
       threadId: parent.threadId,
@@ -106,7 +106,7 @@ describe.skipIf(!hasDatabase())("asking two agents at once", () => {
     const halfway = await mainSessionOf(parent.threadId);
     expect(halfway?.status).toBe("waiting");
     expect(halfway?.lastProgress).toBe("Waiting on @beta…");
-    expect(vi.mocked(superset.sendToAgent)).not.toHaveBeenCalled();
+    expect(vi.mocked(superset.promptChat)).not.toHaveBeenCalled();
 
     const [answered] = (await delegationsOf(parent.threadId)).filter(
       (row) => row.targetMemberId === alpha.id,
@@ -121,7 +121,7 @@ describe.skipIf(!hasDatabase())("asking two agents at once", () => {
     });
 
     const resumed = vi
-      .mocked(superset.sendToAgent)
+      .mocked(superset.promptChat)
       .mock.calls.map((call) => call[0].text)
       .join("\n");
 
@@ -168,7 +168,7 @@ describe.skipIf(!hasDatabase())("asking two agents at once", () => {
     await ask(beta.handle, alpha.handle);
     await standDown(parent.threadId);
 
-    vi.mocked(superset.sendToAgent).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     await delegations.settleDelegationFor({
       threadId: parent.threadId,
@@ -177,7 +177,7 @@ describe.skipIf(!hasDatabase())("asking two agents at once", () => {
     });
 
     const resumed = vi
-      .mocked(superset.sendToAgent)
+      .mocked(superset.promptChat)
       .mock.calls.map((call) => call[0].text)
       .join("\n");
     expect(resumed).toContain("@beta replied:\n\nbeta is done");

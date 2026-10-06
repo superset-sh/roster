@@ -1,52 +1,16 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import { runSessionsInThisProcess } from "./sessions/dispatch";
-
-runSessionsInThisProcess();
-
-const prompts: string[] = [];
-const steers: string[] = [];
-
-vi.mock("@roster/superset", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@roster/superset")>()),
-  createWorkspace: vi.fn(async () => ({ id: "workspace-1" })),
-  runAgent: vi.fn(async (args: { prompt: string }) => {
-    prompts.push(args.prompt);
-    return { sessionId: "terminal-1" };
-  }),
-  sendToAgent: vi.fn(async (args: { text: string }) => {
-    steers.push(args.text);
-  }),
-  interruptAgent: vi.fn(async () => undefined),
-  deleteWorkspace: vi.fn(async () => undefined),
-  clearWorkspaceStatuses: vi.fn(async () => undefined),
-  listAgentBindings: vi.fn(async () => []),
-  readTranscript: vi.fn(async () => ({ chunks: [], nextOffset: 0 })),
-  bindingIsIdle: vi.fn(() => true),
-  isAgentLifecycle: vi.fn(() => false),
-  eventsUrl: vi.fn(() => "http://localhost/events"),
-  mintJwt: vi.fn(async () => ({ jwt: "jwt" })),
-  decodeJwtClaims: vi.fn(() => ({})),
-}));
-
-vi.mock("./sessions/connection", () => ({
-  hostConnection: vi.fn(async () => ({
-    jwt: "jwt",
-    hostKey: "host-1",
-    memberId: "member-1",
-    folder: { supersetProjectId: "superset-project" },
-  })),
-  jwtForMember: vi.fn(async () => ({ jwt: "jwt" })),
-}));
+import { waitFor } from "../test/fake-chat";
+import "../test/mock-superset";
 
 const hasDatabase = Boolean(process.env.DATABASE_URL);
 
-async function waitFor(check: () => boolean, ms = 8000) {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (check()) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+async function promptsSent(atLeast: number): Promise<string[]> {
+  const { promptChat } = await import("@roster/superset");
+  return waitFor(
+    () => vi.mocked(promptChat).mock.calls.map((call) => call[0].text),
+    (texts) => texts.length >= atLeast,
+  );
 }
 
 function png(): Uint8Array {
@@ -180,9 +144,7 @@ describe.skipIf(!hasDatabase)("what an agent session is told about files", () =>
         attachmentIds: [ids.attachment],
       });
 
-      await waitFor(() => prompts.length > 0);
-
-      const prompt = prompts[0] ?? "";
+      const prompt = (await promptsSent(1))[0] ?? "";
       expect(prompt).toContain("have a look at this");
       expect(prompt).toContain("Screenshot.png (image/png)");
       expect(prompt).toContain(`/api/files/${ids.attachment}`);
@@ -212,9 +174,7 @@ describe.skipIf(!hasDatabase)("what an agent session is told about files", () =>
         attachmentIds: [second.attachment.id],
       });
 
-      await waitFor(() => steers.length > 0);
-
-      const steer = steers[0] ?? "";
+      const steer = (await promptsSent(2))[1] ?? "";
       expect(steer).toContain("and the spec");
       expect(steer).toContain("spec.pdf (application/pdf)");
       expect(steer).toContain(`/api/files/${second.attachment.id}`);

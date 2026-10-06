@@ -12,39 +12,41 @@ import {
   threads,
 } from "@roster/db";
 import {
-  bindingIsIdle,
-  clearWorkspaceStatuses,
+  cancelChatTurn,
+  ChatCallError,
+  type ChatApprovalRequest,
+  type ChatBackgroundTask,
+  type ChatCursor,
+  type ChatDurableEvent,
+  chatStreamUrl,
+  closeChatSession,
+  createChatSession,
   createWorkspace,
+  isDeltaChatEnvelope,
+  isDurableChatEnvelope,
+  isResetChatEnvelope,
+  parseChatCursor,
+  parseChatEnvelope,
+  promptChat,
+  respondToChatApproval,
+  serializeChatCursor,
   deleteWorkspace,
-  eventsUrl,
-  interruptAgent,
-  isAgentLifecycle,
-  listAgentBindings,
-  readTranscript,
-  runAgent,
-  sendToAgent,
 } from "@roster/superset";
-import { and, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 
-import {
-  humanSessionError,
-  sessionErrorDetail,
-  workspaceAlreadyGone,
-} from "../../utils/session-error";
+import { humanSessionError, sessionErrorDetail } from "../../utils/session-error";
 import { handleList } from "../../lib/handle-list";
 import { sessionPrompt } from "../../utils/message-run";
 import {
   type DelegationContext,
   rosterEnvelope,
 } from "../../utils/roster-envelope";
-import { agentIsGone } from "../../utils/agent-liveness";
 import {
   type LifecycleEvent,
   nextStatus,
   type ThreadStatus,
 } from "../../utils/session-state";
 import { mergeSteers, undeliveredSteerNotice } from "../../utils/steer-queue";
-import { agentReply, lastMeaningfulLine } from "../../utils/thread-progress";
 import { markdownToTiptap } from "../../utils/tiptap";
 import {
   attachmentsForMessages,
@@ -67,17 +69,11 @@ import { threadPublishState } from "./queries";
 
 export { threadChannelName };
 
-const POLL_INTERVAL_MS = 2000;
 const WRITE_INTERVAL_MS = 1000;
 const MAX_ATTEMPTS = 6;
 const BASE_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
-const SETTLE_DELAY_MS = 1500;
-const STALENESS_TIMEOUT_MS = 60_000;
-const STEER_READY_INTERVAL_MS = 500;
-const STEER_READY_TIMEOUT_MS = 120_000;
 const MAX_PUBLISH_HOPS = 3;
-const REST_POLL_INTERVAL_MS = 30_000;
 export const REST_TTL_MS = 60 * 60 * 1000;
 
 const TERMINAL_STATUSES = ["completed", "failed", "canceled"] as const;
@@ -136,42 +132,6 @@ async function statusAfter(
 
 const COMPLETE_EMOJI = "✅";
 
-interface HostLink {
-  hostKey: string;
-  memberId: string;
-  socket: WebSocket | null;
-  attempts: number;
-  retryTimer: ReturnType<typeof setTimeout> | null;
-  stopped: boolean;
-}
-
-interface Watch {
-  sessionId: string;
-  threadId: string;
-  hostKey: string;
-  memberId: string;
-  workspaceId: string;
-  terminalId: string;
-  pollTimer: ReturnType<typeof setInterval> | null;
-  lastWriteAt: number;
-  lastProgress: string | null;
-  lastStartAt: number;
-  lastStopAt: number;
-  transcript: string | null;
-  transcriptChangedAt: number;
-  bindingEventAt: number | null;
-  bindingChangedAt: number;
-  restingSince: number | null;
-}
-
-const hosts = new Map<string, HostLink>();
-
-function linkKey(hostKey: string, memberId: string): string {
-  return `${memberId}@${hostKey}`;
-}
-
-const watches = new Map<string, Watch>();
-const byTerminal = new Map<string, string>();
 const finishing = new Set<string>();
 const pendingSteers = new Map<string, string[]>();
 
@@ -186,8 +146,10 @@ interface SessionView {
   role: string;
   runAsMemberId: string | null;
   supersetWorkspaceId: string | null;
-  supersetTerminalId: string | null;
   supersetHostKey: string | null;
+  supersetChatSessionId: string | null;
+  supersetHarnessSessionId: string | null;
+  chatCursor: string | null;
   status: string;
   lastProgress: string | null;
   workspaceReapedAt: Date | null;
@@ -205,8 +167,10 @@ const sessionViewColumns = {
   role: threadSessions.role,
   runAsMemberId: threadSessions.runAsMemberId,
   supersetWorkspaceId: threadSessions.supersetWorkspaceId,
-  supersetTerminalId: threadSessions.supersetTerminalId,
   supersetHostKey: threadSessions.supersetHostKey,
+  supersetChatSessionId: threadSessions.supersetChatSessionId,
+  supersetHarnessSessionId: threadSessions.supersetHarnessSessionId,
+  chatCursor: threadSessions.chatCursor,
   status: threadSessions.status,
   lastProgress: threadSessions.lastProgress,
   workspaceReapedAt: threadSessions.workspaceReapedAt,
@@ -357,6 +321,7 @@ async function publishThread(threadId: string, hops = 0): Promise<void> {
       waitingOn: state.waitingOn,
       completedAt: state.completedAt ? state.completedAt.toISOString() : null,
       completedByMemberId: state.completedByMemberId,
+      backgroundWork: state.backgroundWork,
     },
   };
   await Promise.all([
@@ -393,172 +358,13 @@ export async function markWaiting(args: {
   if (row) await publishThread(row.threadId);
 }
 
-function ensureHostLink(hostKey: string, memberId: string): void {
-  const key = linkKey(hostKey, memberId);
-  const existing = hosts.get(key);
-  if (existing && (existing.socket || existing.retryTimer)) return;
-
-  const link: HostLink = existing ?? {
-    hostKey,
-    memberId,
-    socket: null,
-    attempts: 0,
-    retryTimer: null,
-    stopped: false,
-  };
-  link.stopped = false;
-  hosts.set(key, link);
-
-  void (async () => {
-    const auth = await jwtForMember({ memberId, hostKey });
-    if (auth.jwt === null) {
-      await failHostSessions(key, auth.problem);
-      return;
-    }
-
-    let socket: WebSocket;
-    try {
-      socket = new WebSocket(eventsUrl(hostKey), {
-        headers: { Authorization: `Bearer ${auth.jwt}` },
-      } as unknown as string[]);
-    } catch {
-      scheduleHostRetry(key);
-      return;
-    }
-
-    link.socket = socket;
-
-    socket.onopen = () => {
-      const current = hosts.get(key);
-      if (current) current.attempts = 0;
-    };
-
-    socket.onmessage = (event) => {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-      if (!isAgentLifecycle(parsed)) return;
-      handleLifecycle(key, parsed.terminalId, parsed.eventType);
-    };
-
-    socket.onerror = () => {};
-
-    socket.onclose = () => {
-      const current = hosts.get(key);
-      if (!current || current.stopped) return;
-      current.socket = null;
-      if (hasWatchesOn(key)) scheduleHostRetry(key);
-      else hosts.delete(key);
-    };
-  })();
-}
-
-function hasWatchesOn(key: string): boolean {
-  for (const watch of watches.values()) {
-    if (linkKey(watch.hostKey, watch.memberId) === key) return true;
-  }
-  return false;
-}
-
-function scheduleHostRetry(key: string): void {
-  const link = hosts.get(key);
-  if (!link || link.stopped) return;
-
-  if (link.attempts >= MAX_ATTEMPTS) {
-    void failHostSessions(
-      key,
-      "That machine is offline — Roster stopped waiting for it.",
-    );
-    hosts.delete(key);
-    return;
-  }
-
-  const delay = Math.min(BASE_BACKOFF_MS * 2 ** link.attempts, MAX_BACKOFF_MS);
-  link.attempts += 1;
-  link.retryTimer = setTimeout(() => {
-    const current = hosts.get(key);
-    if (current) current.retryTimer = null;
-    if (hasWatchesOn(key)) ensureHostLink(link.hostKey, link.memberId);
-  }, delay);
-}
-
-async function failHostSessions(key: string, reason: string): Promise<void> {
-  const affected = [...watches.values()].filter(
-    (watch) => linkKey(watch.hostKey, watch.memberId) === key,
-  );
-  for (const watch of affected) {
-    await finish({ sessionId: watch.sessionId, status: "failed", error: reason });
-  }
-}
-
-function handleLifecycle(
-  key: string,
-  terminalId: string,
-  eventType: string,
-): void {
-  const sessionId = byTerminal.get(terminalId);
-  if (!sessionId) return;
-
-  const watch = watches.get(sessionId);
-  if (!watch) return;
-  if (linkKey(watch.hostKey, watch.memberId) !== key) return;
-
-  if (eventType === "Failed") {
-    void finish({
-      sessionId,
-      status: "failed",
-      error: "The agent stopped with an error.",
-      capture: true,
-    });
-    return;
-  }
-
-  if (eventType === "Start") {
-    watch.lastStartAt = Date.now();
-    void wake(sessionId);
-    return;
-  }
-
-  if (eventType === "PermissionRequest") {
-    void askForInput(sessionId);
-    return;
-  }
-
-  if (eventType === "Stop" || eventType === "Detached") {
-    watch.lastStopAt = Date.now();
-    void settle(sessionId);
-  }
-}
-
-/** The agent's last turn of speech, or null if its output cannot be read. */
-async function captureReply(
-  session: SessionView,
-  watch: Watch,
-): Promise<string | null> {
-  try {
-    const connection = await hostConnection(session);
-    const transcript = await readTranscript({
-      jwt: connection.jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-      terminalId: watch.terminalId,
-    });
-    return agentReply(transcript.text);
-  } catch {
-    return null;
-  }
-}
-
 /** The agent is working again — clear needs_input, or revive an idle session. */
 async function wake(sessionId: string): Promise<void> {
   const session = await sessionById(sessionId);
   if (!session) return;
 
-  const watch = watches.get(sessionId);
-  if (watch && watch.restingSince !== null) activateWatch(watch);
+  const chat = chatWatches.get(sessionId);
+  if (chat) activateChatWatch(chat);
 
   const status = await statusAfter(session, "Start");
   if (status === null) return;
@@ -568,38 +374,7 @@ async function wake(sessionId: string): Promise<void> {
 }
 
 /**
- * The agent has stopped to ask someone something. Post the question so it is
- * in the thread and the people following it are told, then park at needs_input
- * until somebody answers.
- */
-async function askForInput(sessionId: string): Promise<void> {
-  const watch = watches.get(sessionId);
-  const session = await sessionById(sessionId);
-  if (!session || !watch) return;
-
-  const status = await statusAfter(session, "PermissionRequest");
-  if (status === null) return;
-
-  const question = await captureReply(session, watch);
-
-  const row = await patch(sessionId, { status });
-  if (!row) return;
-
-  if (question && question.trim().length > 0) {
-    await persistAgentMessage({
-      sessionId,
-      thread: threadIdentity(row),
-      text: question,
-      agentMemberId: row.agentMemberId,
-      agentChannelId: row.projectId,
-    });
-  }
-
-  await publishThread(row.threadId);
-}
-
-/**
- * The agent's terminal has gone quiet. A session parked on a delegate stays
+ * The agent's turn has ended. A session parked on a delegate stays
  * parked — the quiet is what parking means — but the turn still ended, and
  * what the agent said before handing the work over belongs in the thread.
  */
@@ -618,291 +393,556 @@ export async function endTurn(
   });
 }
 
-async function settle(sessionId: string): Promise<void> {
-  const watch = watches.get(sessionId);
-  if (!watch) return;
-  const stoppedAt = watch.lastStopAt;
+const CURSOR_WRITE_INTERVAL_MS = 5000;
+const AFFIRMATIVE = /^\s*(y|yes|yep|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\b/i;
 
-  await new Promise((resolve) => setTimeout(resolve, SETTLE_DELAY_MS));
-
-  const current = watches.get(sessionId);
-  if (!current || current.lastStopAt !== stoppedAt) return;
-  if (current.lastStartAt > stoppedAt) return;
-
-  const session = await sessionById(sessionId);
-  if (!session || isTerminal(session.status)) return;
-
-  await endTurn(session, "Stop");
-}
-
-async function pollOnce(sessionId: string): Promise<void> {
-  const watch = watches.get(sessionId);
-  if (!watch) return;
-
-  const session = await sessionById(sessionId);
-  if (!session || isTerminal(session.status)) {
-    stopWatch(sessionId);
-    return;
-  }
-
-  let text: string;
-  let jwt: string;
-  try {
-    const connection = await hostConnection(session);
-    jwt = connection.jwt;
-    const transcript = await readTranscript({
-      jwt: connection.jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-      terminalId: watch.terminalId,
-    });
-    text = transcript.text;
-  } catch (cause) {
-    const reason = humanSessionError(cause, {
-      fallback: "Could not read the agent's output.",
-      retrying: true,
-    });
-    console.warn(
-      `[sessions] transcript poll failed for ${sessionId}: ${sessionErrorDetail(cause)}`,
-    );
-    if (workspaceAlreadyGone(cause)) {
-      await finish({ sessionId, status: "failed", error: reason });
-      return;
-    }
-    if (session.error !== reason) {
-      const row = await patch(sessionId, { error: reason });
-      if (row) await publishThread(row.threadId);
-    }
-    return;
-  }
-
-  const now = Date.now();
-  if (text !== watch.transcript) {
-    watch.transcript = text;
-    watch.transcriptChangedAt = now;
-  }
-
-  let bound = true;
-  try {
-    const bindings = await listAgentBindings({
-      jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-    });
-    const binding = bindings.find((b) => b.terminalId === watch.terminalId);
-    if (bindingIsIdle(binding, SETTLE_DELAY_MS)) {
-      if (pendingSteers.has(sessionId)) {
-        await drainSteers(sessionId);
-        return;
-      }
-      await endTurn(session, "Stop");
-      return;
-    }
-    bound = binding !== undefined;
-    const eventAt = binding?.lastEventAt ?? null;
-    if (eventAt !== watch.bindingEventAt) {
-      watch.bindingEventAt = eventAt;
-      watch.bindingChangedAt = now;
-    }
-  } catch (cause) {
-    console.warn(
-      `[sessions] binding check failed for ${sessionId}: ${sessionErrorDetail(cause)}`,
-    );
-  }
-
-  if (
-    agentIsGone({
-      now,
-      bound,
-      transcriptChangedAt: watch.transcriptChangedAt,
-      bindingChangedAt: watch.bindingChangedAt,
-      timeoutMs: STALENESS_TIMEOUT_MS,
-    })
-  ) {
-    console.warn(
-      `[sessions] nothing has been bound to ${sessionId}'s terminal for ${STALENESS_TIMEOUT_MS}ms and it wrote nothing — ending it`,
-    );
-    await endTurn(session, "Stop");
-    return;
-  }
-
-  const line = lastMeaningfulLine(text);
-  const progressed =
-    !isParked(session.status) &&
-    line !== null &&
-    line !== watch.lastProgress &&
-    now - watch.lastWriteAt >= WRITE_INTERVAL_MS;
-  const recovered = session.error !== null;
-
-  if (!progressed && !recovered) return;
-
-  const values: Partial<SelectThreadSession> = {};
-  if (recovered) values.error = null;
-  if (progressed && line !== null) {
-    watch.lastProgress = line;
-    watch.lastWriteAt = now;
-    values.lastProgress = line;
-    values.transcriptOffset = text.length;
-  }
-
-  const row = await patch(sessionId, values);
-  if (row) await publishThread(row.threadId);
-}
-
-function startWatch(args: {
+interface ChatWatch {
   sessionId: string;
   threadId: string;
   hostKey: string;
   memberId: string;
   workspaceId: string;
-  terminalId: string;
-}): void {
-  stopWatch(args.sessionId);
+  chatSessionId: string;
+  socket: WebSocket | null;
+  attempts: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  restTimer: ReturnType<typeof setTimeout> | null;
+  stopped: boolean;
+  cursor: ChatCursor | null;
+  cursorWrittenAt: number;
+  turnId: string | null;
+  startedTurns: Set<string>;
+  replies: Map<string, string>;
+  lastReply: string | null;
+  lastProgress: string | null;
+  lastWriteAt: number;
+  queue: Promise<void>;
+  pendingProgress: string | null;
+  progressTimer: ReturnType<typeof setTimeout> | null;
+  itemKinds: Map<string, string>;
+  liveText: Map<string, string>;
+  pendingApprovals: Map<string, ChatApprovalRequest>;
+  backgroundKey: string;
+  harnessSessionId: string | null;
+}
 
-  const watch: Watch = {
+const chatWatches = new Map<string, ChatWatch>();
+const chatEventsInFlight = new Set<Promise<void>>();
+
+export async function chatEventsSettled(): Promise<void> {
+  while (chatEventsInFlight.size > 0) await Promise.all([...chatEventsInFlight]);
+}
+
+function startChatWatch(args: {
+  sessionId: string;
+  threadId: string;
+  hostKey: string;
+  memberId: string;
+  workspaceId: string;
+  chatSessionId: string;
+  since?: ChatCursor | null;
+  harnessSessionId?: string | null;
+}): void {
+  const previous = chatWatches.get(args.sessionId);
+  const since =
+    args.since ??
+    (previous?.chatSessionId === args.chatSessionId ? previous.cursor : null);
+  stopChatWatch(args.sessionId);
+
+  const watch: ChatWatch = {
     sessionId: args.sessionId,
     threadId: args.threadId,
     hostKey: args.hostKey,
     memberId: args.memberId,
     workspaceId: args.workspaceId,
-    terminalId: args.terminalId,
-    pollTimer: null,
-    lastWriteAt: 0,
+    chatSessionId: args.chatSessionId,
+    socket: null,
+    attempts: 0,
+    retryTimer: null,
+    restTimer: null,
+    stopped: false,
+    cursor: since,
+    cursorWrittenAt: 0,
+    turnId: null,
+    startedTurns: new Set(),
+    replies: new Map(),
+    lastReply: null,
     lastProgress: null,
-    lastStartAt: 0,
-    lastStopAt: 0,
-    transcript: null,
-    transcriptChangedAt: Date.now(),
-    bindingEventAt: null,
-    bindingChangedAt: Date.now(),
-    restingSince: null,
+    lastWriteAt: 0,
+    queue: Promise.resolve(),
+    pendingProgress: null,
+    progressTimer: null,
+    itemKinds: new Map(),
+    liveText: new Map(),
+    pendingApprovals: new Map(),
+    backgroundKey: "[]",
+    harnessSessionId: args.harnessSessionId ?? null,
   };
-  watches.set(args.sessionId, watch);
-  byTerminal.set(args.terminalId, args.sessionId);
+  chatWatches.set(args.sessionId, watch);
+  connectChatWatch(watch);
+}
 
-  watch.pollTimer = setInterval(() => {
-    void pollOnce(args.sessionId);
-  }, POLL_INTERVAL_MS);
+function connectChatWatch(watch: ChatWatch): void {
+  void (async () => {
+    let auth: Awaited<ReturnType<typeof jwtForMember>>;
+    try {
+      auth = await jwtForMember({
+        memberId: watch.memberId,
+        hostKey: watch.hostKey,
+      });
+    } catch (cause) {
+      auth = {
+        jwt: null,
+        problem: humanSessionError(cause, {
+          fallback: "Could not sign in to Superset to reach that machine.",
+        }),
+      };
+    }
+    if (watch.stopped) return;
+    if (auth.jwt === null) {
+      stopChatWatch(watch.sessionId);
+      await finish({ sessionId: watch.sessionId, status: "failed", error: auth.problem });
+      return;
+    }
 
-  ensureHostLink(args.hostKey, args.memberId);
-  void pollOnce(args.sessionId);
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(
+        chatStreamUrl({
+          routingKey: watch.hostKey,
+          sessionId: watch.chatSessionId,
+          jwt: auth.jwt,
+          since: watch.cursor,
+          deltas: ["text"],
+        }),
+      );
+    } catch {
+      scheduleChatRetry(watch);
+      return;
+    }
+    watch.socket = socket;
+
+    socket.onopen = () => {
+      watch.attempts = 0;
+    };
+
+    socket.onmessage = (event) => {
+      if (watch.socket !== socket) return;
+      const envelope = parseChatEnvelope(String(event.data));
+      if (!envelope) return;
+      if (isResetChatEnvelope(envelope)) {
+        watch.cursor = null;
+        if (envelope.reset.reason === "session_not_found") {
+          void finish({
+            sessionId: watch.sessionId,
+            status: "failed",
+            error: "The agent session is gone from that machine.",
+          });
+        }
+        return;
+      }
+      if (isDeltaChatEnvelope(envelope)) {
+        if (envelope.delta.type === "text") chatTextDelta(watch, envelope.delta);
+        return;
+      }
+      if (!isDurableChatEnvelope(envelope)) return;
+      const { cursor, event: chatEvent } = envelope;
+      const handled = watch.queue.then(async () => {
+        try {
+          await handleChatEvent(watch, chatEvent);
+        } catch (cause) {
+          console.warn(
+            `[sessions] chat event failed for ${watch.sessionId}: ${sessionErrorDetail(cause)}`,
+          );
+        }
+        watch.cursor = cursor;
+        await saveChatCursor(watch, true);
+      });
+      watch.queue = handled;
+      chatEventsInFlight.add(handled);
+      void handled.finally(() => chatEventsInFlight.delete(handled));
+    };
+
+    socket.onerror = () => {};
+
+    socket.onclose = () => {
+      if (watch.socket !== socket) return;
+      watch.socket = null;
+      scheduleChatRetry(watch);
+    };
+  })();
+}
+
+function scheduleChatRetry(watch: ChatWatch): void {
+  if (watch.stopped || chatWatches.get(watch.sessionId) !== watch) return;
+
+  if (watch.attempts >= MAX_ATTEMPTS) {
+    stopChatWatch(watch.sessionId);
+    void finish({
+      sessionId: watch.sessionId,
+      status: "failed",
+      error: "That machine is offline — Roster stopped waiting for it.",
+    });
+    return;
+  }
+
+  const delay = Math.min(BASE_BACKOFF_MS * 2 ** watch.attempts, MAX_BACKOFF_MS);
+  watch.attempts += 1;
+  watch.retryTimer = setTimeout(() => {
+    watch.retryTimer = null;
+    if (!watch.stopped) connectChatWatch(watch);
+  }, delay);
+}
+
+function stopChatWatch(sessionId: string): void {
+  const watch = chatWatches.get(sessionId);
+  if (!watch) return;
+  watch.stopped = true;
+  if (watch.retryTimer) clearTimeout(watch.retryTimer);
+  if (watch.restTimer) clearTimeout(watch.restTimer);
+  if (watch.progressTimer) clearTimeout(watch.progressTimer);
+  const socket = watch.socket;
+  watch.socket = null;
+  try {
+    socket?.close();
+  } catch {}
+  chatWatches.delete(sessionId);
+  void saveChatCursor(watch, true);
+}
+
+function restChatWatch(watch: ChatWatch): void {
+  if (watch.restTimer) clearTimeout(watch.restTimer);
+  watch.restTimer = setTimeout(() => {
+    if (chatWatches.get(watch.sessionId) === watch) stopChatWatch(watch.sessionId);
+  }, REST_TTL_MS);
+}
+
+function activateChatWatch(watch: ChatWatch): void {
+  if (watch.restTimer) clearTimeout(watch.restTimer);
+  watch.restTimer = null;
+}
+
+async function saveChatCursor(watch: ChatWatch, force = false): Promise<void> {
+  if (!watch.cursor) return;
+  const now = Date.now();
+  if (!force && now - watch.cursorWrittenAt < CURSOR_WRITE_INTERVAL_MS) return;
+  watch.cursorWrittenAt = now;
+  await db
+    .update(threadSessions)
+    .set({ chatCursor: serializeChatCursor(watch.cursor) })
+    .where(
+      and(
+        eq(threadSessions.id, watch.sessionId),
+        eq(threadSessions.supersetChatSessionId, watch.chatSessionId),
+      ),
+    );
+}
+
+function lastLine(text: string): string | null {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const line = lines.at(-1);
+  if (!line) return null;
+  return line.length > 200 ? `${line.slice(0, 200)}…` : line;
+}
+
+function chatTextDelta(watch: ChatWatch, delta: { itemId: string; append: string }): void {
+  const kind = watch.itemKinds.get(delta.itemId);
+  if (kind === "reasoning") {
+    void chatProgress(watch, "Thinking…");
+    return;
+  }
+  if (kind !== "agent_message") return;
+  const text = (watch.liveText.get(delta.itemId) ?? "") + delta.append;
+  watch.liveText.set(delta.itemId, text);
+  void chatProgress(watch, lastLine(text));
+}
+
+async function chatProgress(watch: ChatWatch, line: string | null): Promise<void> {
+  if (line === null || line === watch.lastProgress) return;
+  watch.pendingProgress = line;
+  const wait = WRITE_INTERVAL_MS - (Date.now() - watch.lastWriteAt);
+  if (wait > 0) {
+    watch.progressTimer ??= setTimeout(() => {
+      watch.progressTimer = null;
+      void writeChatProgress(watch);
+    }, wait);
+    return;
+  }
+  await writeChatProgress(watch);
+}
+
+async function writeChatProgress(watch: ChatWatch): Promise<void> {
+  const line = watch.pendingProgress;
+  watch.pendingProgress = null;
+  if (line === null || line === watch.lastProgress || watch.stopped) return;
+  watch.lastProgress = line;
+  watch.lastWriteAt = Date.now();
+
+  const session = await sessionById(watch.sessionId);
+  if (!session || isTerminal(session.status) || isParked(session.status)) return;
+
+  const row = await patch(watch.sessionId, { lastProgress: line, error: null });
+  if (row) await publishThread(row.threadId);
+}
+
+async function handleChatEvent(
+  watch: ChatWatch,
+  event: ChatDurableEvent,
+): Promise<void> {
+  if (chatWatches.get(watch.sessionId) !== watch) return;
+
+  if (event.type === "session") {
+    await chatSessionState(watch, event.session.backgroundTasks ?? [], event.session.harnessSessionId);
+    return;
+  }
+
+  if (event.type === "turn") {
+    const turn = event.turn;
+    if (turn.status === "running") {
+      watch.turnId = turn.id;
+      watch.startedTurns.add(turn.id);
+      await wake(watch.sessionId);
+      return;
+    }
+    if (watch.turnId === turn.id) watch.turnId = null;
+    const seen = watch.startedTurns.delete(turn.id);
+    if (!seen && (turn.completedAtMs ?? turn.startedAtMs) <= turn.startedAtMs) return;
+    watch.lastReply = watch.replies.get(turn.id) ?? null;
+    watch.replies.delete(turn.id);
+    watch.pendingApprovals.clear();
+
+    if (turn.status === "failed") {
+      await finish({
+        sessionId: watch.sessionId,
+        status: "failed",
+        error: turn.error?.message ?? "The agent stopped with an error.",
+        capture: true,
+      });
+      return;
+    }
+
+    if (!seen) await wake(watch.sessionId);
+    const session = await sessionById(watch.sessionId);
+    if (!session || isTerminal(session.status)) return;
+    await endTurn(session, "Stop");
+    return;
+  }
+
+  const item = event.item;
+  watch.itemKinds.set(item.id, item.kind);
+  switch (item.kind) {
+    case "reasoning":
+      await chatProgress(watch, "Thinking…");
+      return;
+    case "agent_message":
+      if (item.completedAtMs !== undefined) watch.liveText.delete(item.id);
+      if (item.text.trim().length > 0) {
+        watch.replies.set(event.turnId, item.text);
+        await chatProgress(watch, lastLine(item.text));
+      }
+      return;
+    case "tool_call":
+      if (item.status === "running") await chatProgress(watch, item.title);
+      return;
+    case "approval_request":
+      if (item.status === "pending") {
+        if (watch.pendingApprovals.has(item.id)) return;
+        watch.pendingApprovals.set(item.id, item);
+        await chatAskForInput(watch, item);
+        return;
+      }
+      if (watch.pendingApprovals.delete(item.id) && watch.pendingApprovals.size === 0) {
+        await wake(watch.sessionId);
+      }
+      return;
+    default:
+      return;
+  }
+}
+
+async function chatSessionState(
+  watch: ChatWatch,
+  tasks: ChatBackgroundTask[],
+  harnessSessionId: string | undefined,
+): Promise<void> {
+  const values: Partial<SelectThreadSession> = {};
+
+  if (harnessSessionId && harnessSessionId !== watch.harnessSessionId) {
+    watch.harnessSessionId = harnessSessionId;
+    values.supersetHarnessSessionId = harnessSessionId;
+  }
+
+  const key = JSON.stringify(tasks);
+  const tasksChanged = key !== watch.backgroundKey;
+  if (tasksChanged) {
+    watch.backgroundKey = key;
+    values.backgroundTasks = tasks.map((task) => ({
+      id: task.id,
+      kind: task.kind,
+      name: task.name,
+      ...(task.detail ? { detail: task.detail } : {}),
+      canStop: task.canStop,
+      startedAtMs: task.startedAtMs,
+    }));
+  }
+
+  if (Object.keys(values).length === 0) return;
+  const row = await patch(watch.sessionId, values);
+  if (row && tasksChanged) await publishThread(row.threadId);
+}
+
+function approvalQuestion(item: ChatApprovalRequest): string {
+  const options = (item.options ?? []).map((option) => option.label);
+  const choices =
+    options.length > 0 ? `\n\nOptions: ${options.join(" · ")}` : "";
+  return `**Needs your approval:** ${item.title}${choices}\n\nReply *yes* to allow it, or anything else to decline.`;
+}
+
+async function chatAskForInput(
+  watch: ChatWatch,
+  item: ChatApprovalRequest,
+): Promise<void> {
+  const session = await sessionById(watch.sessionId);
+  if (!session) return;
+
+  const status = await statusAfter(session, "PermissionRequest");
+  if (status === null) return;
+
+  const row = await patch(watch.sessionId, { status, lastProgress: item.title });
+  if (!row) return;
+
+  await persistAgentMessage({
+    sessionId: watch.sessionId,
+    thread: threadIdentity(row),
+    text: approvalQuestion(item),
+    agentMemberId: row.agentMemberId,
+    agentChannelId: row.projectId,
+  });
+
+  await publishThread(row.threadId);
+}
+
+function decisionFor(item: ChatApprovalRequest, allow: boolean) {
+  const wanted = allow ? ["allow_once", "allow_always"] : ["reject_once", "reject_always"];
+  const option = (item.options ?? []).find(
+    (candidate) => candidate.kind !== undefined && wanted.includes(candidate.kind),
+  );
+  if (option) return { type: "option" as const, optionId: option.optionId };
+  return allow ? { type: "accept" as const } : { type: "decline" as const };
+}
+
+/** Answers a pending approval with a thread reply; true when the reply was the answer. */
+async function answerApprovals(
+  session: SessionView,
+  host: { jwt: string; routingKey: string },
+  text: string,
+): Promise<boolean> {
+  const watch = chatWatches.get(session.id);
+  if (!watch || watch.pendingApprovals.size === 0) return false;
+
+  const allow = AFFIRMATIVE.test(text);
+  for (const item of [...watch.pendingApprovals.values()]) {
+    await respondToChatApproval({
+      ...host,
+      sessionId: watch.chatSessionId,
+      approvalId: item.id,
+      decision: decisionFor(item, allow),
+    });
+  }
+  return allow;
+}
+
+async function chatHost(session: SessionView) {
+  const connection = await hostConnection(session);
+  return {
+    connection,
+    host: {
+      jwt: connection.jwt,
+      routingKey: session.supersetHostKey ?? connection.hostKey,
+    },
+  };
 }
 
 /**
- * A turn ended at idle, but the harness may still be running sub-agents or
- * background tasks that re-invoke the agent when they finish. Keep the watch
- * alive at a slow cadence so that later work still lands in the thread,
- * instead of vanishing into a terminal nobody reads.
+ * Delivers text to a session's chat, reopening the harness when the host lost
+ * it (a host-service restart keeps the transcript but not the process).
  */
-function restWatch(watch: Watch): void {
-  if (watch.pollTimer) clearInterval(watch.pollTimer);
-  watch.restingSince = Date.now();
-  watch.pollTimer = setInterval(() => {
-    void restPollOnce(watch.sessionId);
-  }, REST_POLL_INTERVAL_MS);
+function harnessIsGone(cause: unknown): boolean {
+  return (
+    cause instanceof ChatCallError &&
+    (cause.code === "NOT_FOUND" || cause.code === "CONFLICT")
+  );
 }
 
-function activateWatch(watch: Watch): void {
-  if (watch.pollTimer) clearInterval(watch.pollTimer);
-  const now = Date.now();
-  watch.restingSince = null;
-  watch.transcriptChangedAt = now;
-  watch.bindingChangedAt = now;
-  watch.pollTimer = setInterval(() => {
-    void pollOnce(watch.sessionId);
-  }, POLL_INTERVAL_MS);
-}
+async function deliverToChat(args: {
+  session: SessionView;
+  text: string;
+  briefIfNew?: boolean;
+}): Promise<void> {
+  const { session } = args;
+  const workspaceId = session.supersetWorkspaceId;
+  if (!workspaceId) throw new Error("That session has no worktree.");
 
-export function restAction(args: {
-  restingSince: number;
-  now: number;
-  transcriptChanged: boolean;
-  bindingActive: boolean;
-}): "wake" | "stop" | "sleep" {
-  if (args.transcriptChanged || args.bindingActive) return "wake";
-  if (args.now - args.restingSince >= REST_TTL_MS) return "stop";
-  return "sleep";
-}
+  const { connection, host } = await chatHost(session);
+  let chatSessionId = session.supersetChatSessionId;
+  let fresh = false;
+  let delivered = false;
 
-async function restPollOnce(sessionId: string): Promise<void> {
-  const watch = watches.get(sessionId);
-  if (!watch || watch.restingSince === null) return;
+  if (chatSessionId) {
+    const answered = await answerApprovals(session, host, args.text).catch(() => false);
+    if (answered) return;
 
-  const session = await sessionById(sessionId);
-  if (!session || isTerminal(session.status)) {
-    stopWatch(sessionId);
-    return;
-  }
-  if (isParked(session.status)) {
-    stopWatch(sessionId);
-    return;
-  }
-  if (!isIdle(session.status)) {
-    activateWatch(watch);
-    return;
-  }
-
-  let transcriptChanged = false;
-  let bindingActive = false;
-  try {
-    const connection = await hostConnection(session);
-    const transcript = await readTranscript({
-      jwt: connection.jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-      terminalId: watch.terminalId,
-    });
-    transcriptChanged =
-      watch.transcript !== null && transcript.text !== watch.transcript;
-    watch.transcript = transcript.text;
-
-    const bindings = await listAgentBindings({
-      jwt: connection.jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-    });
-    const binding = bindings.find((b) => b.terminalId === watch.terminalId);
-    bindingActive =
-      binding !== undefined && !bindingIsIdle(binding, SETTLE_DELAY_MS);
-  } catch (cause) {
-    console.warn(
-      `[sessions] rest poll failed for ${sessionId}: ${sessionErrorDetail(cause)}`,
-    );
-    if (workspaceAlreadyGone(cause)) stopWatch(sessionId);
-    return;
-  }
-
-  const action = restAction({
-    restingSince: watch.restingSince,
-    now: Date.now(),
-    transcriptChanged,
-    bindingActive,
-  });
-  if (action === "stop") {
-    stopWatch(sessionId);
-    return;
-  }
-  if (action === "wake") await wake(sessionId);
-}
-
-function stopWatch(sessionId: string): void {
-  const watch = watches.get(sessionId);
-  if (!watch) return;
-  if (watch.pollTimer) clearInterval(watch.pollTimer);
-  byTerminal.delete(watch.terminalId);
-  watches.delete(sessionId);
-
-  const key = linkKey(watch.hostKey, watch.memberId);
-  if (!hasWatchesOn(key)) {
-    const link = hosts.get(key);
-    if (link) {
-      link.stopped = true;
-      if (link.retryTimer) clearTimeout(link.retryTimer);
-      try {
-        link.socket?.close();
-      } catch {}
-      hosts.delete(key);
+    try {
+      await promptChat({ ...host, sessionId: chatSessionId, text: args.text });
+      delivered = true;
+    } catch (cause) {
+      if (!harnessIsGone(cause)) throw cause;
+      chatSessionId = null;
     }
+  }
+
+  if (!chatSessionId) {
+    const created = await createChatSession({
+      ...host,
+      workspaceId,
+      resumeHarnessSessionId: session.supersetHarnessSessionId,
+    });
+    fresh = !session.supersetHarnessSessionId;
+    chatSessionId = created.sessionId;
+    await patch(session.id, {
+      supersetChatSessionId: chatSessionId,
+      chatCursor: null,
+    });
+  }
+
+  if (!delivered) {
+    const text =
+      fresh && args.briefIfNew !== false
+        ? await briefedPrompt({ session, request: args.text })
+        : args.text;
+    await promptChat({ ...host, sessionId: chatSessionId, text });
+  }
+
+  const existing = chatWatches.get(session.id);
+  if (!existing || existing.chatSessionId !== chatSessionId) {
+    startChatWatch({
+      sessionId: session.id,
+      threadId: session.threadId,
+      hostKey: host.routingKey,
+      memberId: connection.memberId,
+      workspaceId,
+      chatSessionId,
+      since:
+        session.supersetChatSessionId === chatSessionId
+          ? parseChatCursor(session.chatCursor)
+          : null,
+      harnessSessionId: session.supersetHarnessSessionId,
+    });
+  } else {
+    activateChatWatch(existing);
   }
 }
 
@@ -944,22 +984,22 @@ async function finishOnce(args: {
   capture?: boolean;
   evenIfParked?: boolean;
 }): Promise<FinishOutcome> {
-  const watch = watches.get(args.sessionId);
   const session = await sessionById(args.sessionId);
   if (!session || isTerminal(session.status)) {
-    stopWatch(args.sessionId);
+    stopChatWatch(args.sessionId);
     if (session) await reportUndelivered(args.sessionId, "that session had already ended.");
     else pendingSteers.delete(args.sessionId);
     return NOTHING_TO_RESUME;
   }
 
-  const finalText =
-    args.capture && watch ? await captureReply(session, watch) : null;
+  const chat = chatWatches.get(args.sessionId);
+  const finalText = args.capture ? (chat?.lastReply ?? null) : null;
+  if (chat) chat.lastReply = null;
 
-  if (args.status === "idle" && watch && !isParked(session.status)) {
-    restWatch(watch);
+  if (args.status === "idle" && chat && !isParked(session.status)) {
+    restChatWatch(chat);
   } else {
-    stopWatch(args.sessionId);
+    stopChatWatch(args.sessionId);
   }
   const queued = takeSteers(args.sessionId);
 
@@ -981,6 +1021,7 @@ async function finishOnce(args: {
     endedAt: new Date(),
   };
   if (args.error !== undefined) values.error = args.error;
+  if (isTerminal(args.status)) values.backgroundTasks = [];
 
   const row = await patchLive(args.sessionId, values);
   if (!row) {
@@ -1300,43 +1341,13 @@ async function startSessionRow(args: {
       delegation: args.delegation,
     });
 
-    const run = await runAgent({
-      jwt: connection.jwt,
-      routingKey: hostKey,
-      workspaceId: workspace.id,
-      prompt,
-    });
-
-    const current = await sessionById(session.id);
-    if (current && isTerminal(current.status)) {
-      console.warn(
-        `[sessions] ${session.id} was ${current.status} before its agent came up — not reviving it`,
-      );
-      await patch(session.id, { supersetTerminalId: run.sessionId });
-      await reportUndelivered(session.id, `that session was ${current.status}.`);
-      return;
-    }
-
-    const running = await patch(session.id, {
-      supersetTerminalId: run.sessionId,
-      status: "running",
-      error: null,
-    });
-    if (running) await publishThread(running.threadId);
-
-    startWatch({
-      sessionId: session.id,
-      threadId: session.threadId,
+    await startChatSession({
+      session,
       hostKey,
       memberId: connection.memberId,
+      jwt: connection.jwt,
       workspaceId: workspace.id,
-      terminalId: run.sessionId,
-    });
-
-    void drainWhenReady(session.id).catch((cause: unknown) => {
-      console.warn(
-        `[sessions] drain-on-start failed for ${session.id}: ${sessionErrorDetail(cause)}`,
-      );
+      prompt,
     });
   } catch (cause) {
     console.warn(
@@ -1353,55 +1364,55 @@ async function startSessionRow(args: {
   }
 }
 
+async function startChatSession(args: {
+  session: SessionView;
+  hostKey: string;
+  memberId: string;
+  jwt: string;
+  workspaceId: string;
+  prompt: string;
+}): Promise<void> {
+  const { session } = args;
+  const host = { jwt: args.jwt, routingKey: args.hostKey };
+
+  const created = await createChatSession({ ...host, workspaceId: args.workspaceId });
+  await patch(session.id, {
+    supersetChatSessionId: created.sessionId,
+    supersetHarnessSessionId: null,
+    chatCursor: null,
+  });
+
+  const current = await sessionById(session.id);
+  if (current && isTerminal(current.status)) {
+    console.warn(
+      `[sessions] ${session.id} was ${current.status} before its agent came up — not reviving it`,
+    );
+    await reportUndelivered(session.id, `that session was ${current.status}.`);
+    return;
+  }
+
+  startChatWatch({
+    sessionId: session.id,
+    threadId: session.threadId,
+    hostKey: args.hostKey,
+    memberId: args.memberId,
+    workspaceId: args.workspaceId,
+    chatSessionId: created.sessionId,
+  });
+
+  await promptChat({ ...host, sessionId: created.sessionId, text: args.prompt });
+
+  const running = await patch(session.id, { status: "running", error: null });
+  if (running) await publishThread(running.threadId);
+
+  await drainSteers(session.id);
+}
+
 function queueSteer(sessionId: string, text: string): void {
   const queue = pendingSteers.get(sessionId) ?? [];
   queue.push(text);
   pendingSteers.set(sessionId, queue);
   console.warn(`[sessions] queued steer for ${sessionId} (${queue.length})`);
-}
-
-async function drainWhenReady(sessionId: string): Promise<void> {
-  const deadline = Date.now() + STEER_READY_TIMEOUT_MS;
-
-  while (pendingSteers.has(sessionId)) {
-    const watch = watches.get(sessionId);
-    if (!watch) return;
-
-    const session = await sessionById(sessionId);
-    if (!session || isTerminal(session.status)) return;
-
-    if (await terminalIsListening(session, watch)) {
-      await drainSteers(sessionId);
-      return;
-    }
-
-    if (Date.now() >= deadline) {
-      console.warn(
-        `[sessions] agent never came up for ${sessionId} — queued steer(s) left for the watch`,
-      );
-      return;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, STEER_READY_INTERVAL_MS));
-  }
-}
-
-async function terminalIsListening(
-  session: SessionView,
-  watch: Watch,
-): Promise<boolean> {
-  try {
-    const connection = await hostConnection(session);
-    const bindings = await listAgentBindings({
-      jwt: connection.jwt,
-      routingKey: watch.hostKey,
-      workspaceId: watch.workspaceId,
-    });
-    const binding = bindings.find((b) => b.terminalId === watch.terminalId);
-    return bindingIsIdle(binding, SETTLE_DELAY_MS);
-  } catch {
-    return false;
-  }
 }
 
 async function drainSteers(sessionId: string): Promise<void> {
@@ -1444,12 +1455,8 @@ async function interrupt(args: {
   const session = await sessionById(args.sessionId);
   if (!session) return false;
 
-  if (!session.supersetTerminalId || !session.supersetWorkspaceId) {
+  if (!session.supersetWorkspaceId) {
     if (isTerminal(session.status)) {
-      if (session.supersetWorkspaceId && !session.workspaceReapedAt) {
-        await resume({ sessionId: args.sessionId, text: args.text });
-        return true;
-      }
       await recordSessionError(
         args.sessionId,
         undeliveredSteerNotice(1, "that session had already ended."),
@@ -1460,35 +1467,9 @@ async function interrupt(args: {
   }
 
   try {
-    const connection = await hostConnection(session);
-    await sendToAgent({
-      jwt: connection.jwt,
-      routingKey: connection.hostKey,
-      workspaceId: session.supersetWorkspaceId,
-      terminalId: session.supersetTerminalId,
-      text: args.text,
-    });
-
-    const watch = watches.get(args.sessionId);
-    if (watch) watch.lastStartAt = Date.now();
-
-    const row = await patch(args.sessionId, {
-      status: "running",
-      error: null,
-    });
+    await deliverToChat({ session, text: args.text });
+    const row = await patch(args.sessionId, { status: "running", error: null });
     if (row) await publishThread(row.threadId);
-
-    if (!watches.has(args.sessionId)) {
-      startWatch({
-        sessionId: session.id,
-        threadId: session.threadId,
-        hostKey: connection.hostKey,
-        memberId: connection.memberId,
-        workspaceId: session.supersetWorkspaceId,
-        terminalId: session.supersetTerminalId,
-      });
-    }
-
     return true;
   } catch (cause) {
     console.warn(
@@ -1525,45 +1506,7 @@ async function resume(args: {
   if (revived) await publishThread(revived.threadId);
 
   try {
-    const connection = await hostConnection(session);
-    let terminalId = session.supersetTerminalId;
-
-    if (terminalId) {
-      try {
-        await sendToAgent({
-          jwt: connection.jwt,
-          routingKey: connection.hostKey,
-          workspaceId: session.supersetWorkspaceId,
-          terminalId,
-          text: args.text,
-        });
-      } catch {
-        terminalId = null;
-      }
-    }
-
-    if (!terminalId) {
-      const run = await runAgent({
-        jwt: connection.jwt,
-        routingKey: connection.hostKey,
-        workspaceId: session.supersetWorkspaceId,
-        prompt: await briefedPrompt({ session, request: args.text }),
-      });
-      terminalId = run.sessionId;
-      await patch(args.sessionId, { supersetTerminalId: terminalId });
-    }
-
-    startWatch({
-      sessionId: session.id,
-      threadId: session.threadId,
-      hostKey: connection.hostKey,
-      memberId: connection.memberId,
-      workspaceId: session.supersetWorkspaceId,
-      terminalId,
-    });
-
-    const watch = watches.get(args.sessionId);
-    if (watch) watch.lastStartAt = Date.now();
+    await deliverToChat({ session, text: args.text });
   } catch (cause) {
     console.warn(
       `[sessions] resume failed for ${args.sessionId}: ${sessionErrorDetail(cause)}`,
@@ -1638,51 +1581,10 @@ async function retryPrompt(session: SessionView): Promise<string> {
 }
 
 async function reattach(session: SessionView): Promise<void> {
-  const workspaceId = session.supersetWorkspaceId;
-  if (!workspaceId) return;
+  if (!session.supersetWorkspaceId) return;
 
   try {
-    const connection = await hostConnection(session);
-    let terminalId = session.supersetTerminalId;
-
-    if (terminalId) {
-      try {
-        await readTranscript({
-          jwt: connection.jwt,
-          routingKey: connection.hostKey,
-          workspaceId,
-          terminalId,
-        });
-      } catch {
-        terminalId = null;
-      }
-    }
-
-    if (!terminalId) {
-      const run = await runAgent({
-        jwt: connection.jwt,
-        routingKey: connection.hostKey,
-        workspaceId,
-        prompt: await briefedPrompt({
-          session,
-          request: await retryPrompt(session),
-        }),
-      });
-      terminalId = run.sessionId;
-      await patch(session.id, { supersetTerminalId: terminalId });
-    }
-
-    startWatch({
-      sessionId: session.id,
-      threadId: session.threadId,
-      hostKey: connection.hostKey,
-      memberId: connection.memberId,
-      workspaceId,
-      terminalId,
-    });
-
-    const watch = watches.get(session.id);
-    if (watch) watch.lastStartAt = Date.now();
+    await deliverToChat({ session, text: await retryPrompt(session) });
   } catch (cause) {
     console.warn(
       `[sessions] retry failed for ${session.id}: ${sessionErrorDetail(cause)}`,
@@ -1745,21 +1647,15 @@ async function closeOpenDelegations(parentThreadId: string): Promise<string[]> {
 }
 
 async function cancelSession(session: SessionView): Promise<void> {
-  if (session.supersetWorkspaceId && session.supersetTerminalId) {
+  if (session.supersetChatSessionId) {
     try {
-      const connection = await hostConnection(session);
-      await interruptAgent({
-        jwt: connection.jwt,
-        routingKey: session.supersetHostKey ?? connection.hostKey,
-        workspaceId: session.supersetWorkspaceId,
-        terminalId: session.supersetTerminalId,
-      });
-      await clearWorkspaceStatuses({
-        jwt: connection.jwt,
-        routingKey: session.supersetHostKey ?? connection.hostKey,
-        workspaceId: session.supersetWorkspaceId,
-        terminalId: session.supersetTerminalId,
-      });
+      const { host } = await chatHost(session);
+      const turnId = chatWatches.get(session.id)?.turnId;
+      if (turnId) {
+        await cancelChatTurn({ ...host, sessionId: session.supersetChatSessionId, turnId });
+      } else {
+        await closeChatSession({ ...host, sessionId: session.supersetChatSessionId });
+      }
     } catch (cause) {
       console.warn(
         `[sessions] cancel on host failed for ${session.id}: ${sessionErrorDetail(cause)}`,
@@ -1780,11 +1676,18 @@ export async function reapThread(args: { threadId: string }): Promise<void> {
   const reaped = new Set<string>();
 
   for (const session of sessions) {
-    stopWatch(session.id);
+    stopChatWatch(session.id);
     pendingSteers.delete(session.id);
 
     const workspaceId = session.supersetWorkspaceId;
     if (!workspaceId || session.workspaceReapedAt) continue;
+
+    if (session.supersetChatSessionId) {
+      try {
+        const { host } = await chatHost(session);
+        await closeChatSession({ ...host, sessionId: session.supersetChatSessionId });
+      } catch {}
+    }
 
     if (!reaped.has(workspaceId)) {
       try {
@@ -1862,7 +1765,7 @@ export async function retryThread(args: {
     return false;
   }
 
-  stopWatch(session.id);
+  stopChatWatch(session.id);
 
   const revived = await patch(session.id, {
     status: "running",
@@ -1885,11 +1788,19 @@ export function ensureStarted(): Promise<void> {
       .select(sessionViewColumns)
       .from(threadSessions)
       .innerJoin(threads, eq(threadSessions.threadId, threads.id))
-      .where(inArray(threadSessions.status, ["starting", "running"]));
+      .where(
+        or(
+          inArray(threadSessions.status, ["starting", "running", "needs_input"]),
+          and(
+            eq(threadSessions.status, "idle"),
+            gte(threadSessions.endedAt, new Date(Date.now() - REST_TTL_MS)),
+          ),
+        ),
+      );
     started = true;
     for (const row of rows) {
       if (
-        !row.supersetTerminalId ||
+        !row.supersetChatSessionId ||
         !row.supersetWorkspaceId ||
         !row.supersetHostKey
       ) {
@@ -1901,13 +1812,15 @@ export function ensureStarted(): Promise<void> {
         continue;
       }
 
-      startWatch({
+      startChatWatch({
         sessionId: row.id,
         threadId: row.threadId,
         hostKey: row.supersetHostKey,
         memberId: row.runAsMemberId,
         workspaceId: row.supersetWorkspaceId,
-        terminalId: row.supersetTerminalId,
+        chatSessionId: row.supersetChatSessionId,
+        since: parseChatCursor(row.chatCursor),
+        harnessSessionId: row.supersetHarnessSessionId,
       });
     }
   })().catch(() => {

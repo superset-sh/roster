@@ -1,6 +1,7 @@
 import { agentsRouter } from "./routers/agents";
 import { apiKeysRouter } from "./routers/api-keys";
 import { channelsRouter } from "./routers/channels";
+import { chatRouter } from "./routers/chat";
 import { cliRouter } from "./routers/cli";
 import { inviteLinksRouter } from "./routers/invite-links";
 import { messagesRouter } from "./routers/messages";
@@ -11,7 +12,6 @@ import { realtimeRouter } from "./routers/realtime";
 import { searchRouter } from "./routers/search";
 import { supersetRouter } from "./routers/superset";
 import { tasksRouter } from "./routers/tasks";
-import { terminalsRouter } from "./routers/terminals";
 import { threadsRouter } from "./routers/threads";
 import { listUserOrganizations } from "./services/org";
 import { createTRPCRouter, protectedProcedure } from "./trpc";
@@ -25,12 +25,12 @@ export const appRouter = createTRPCRouter({
   onboarding: onboardingRouter,
   agents: agentsRouter,
   channels: channelsRouter,
+  chat: chatRouter,
   cli: cliRouter,
   apiKeys: apiKeysRouter,
   inviteLinks: inviteLinksRouter,
   messages: messagesRouter,
   tasks: tasksRouter,
-  terminals: terminalsRouter,
   threads: threadsRouter,
   notifications: notificationsRouter,
   reactions: reactionsRouter,

@@ -2,9 +2,9 @@ import { loadOnboardingState, resolveStep } from "@roster/api";
 import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
 
-import { DockProvider } from "~/components/terminals/dock-provider";
-import { DockStatusBar } from "~/components/terminals/dock-status-bar";
-import { TerminalDock } from "~/components/terminals/terminal-dock";
+import { AgentStatusBar } from "~/components/chat/agent-status-bar";
+import { ChatPanel } from "~/components/chat/chat-panel";
+import { ChatPanelProvider } from "~/components/chat/chat-panel-provider";
 import { requireOrg } from "~/lib/session";
 
 export default async function OrgLayout({
@@ -25,12 +25,12 @@ export default async function OrgLayout({
   if (resolveStep(state) !== "done") redirect("/onboarding");
 
   return (
-    <DockProvider orgSlug={organization.slug}>
+    <ChatPanelProvider orgSlug={organization.slug}>
       <div className="bg-background flex h-dvh flex-col">
         <div className="min-h-0 flex-1">{children}</div>
-        <TerminalDock />
-        <DockStatusBar orgSlug={organization.slug} />
+        <AgentStatusBar orgSlug={organization.slug} />
       </div>
-    </DockProvider>
+      <ChatPanel />
+    </ChatPanelProvider>
   );
 }

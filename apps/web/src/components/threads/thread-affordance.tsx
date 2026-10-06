@@ -1,5 +1,6 @@
 "use client";
 
+import { Bot, SquareTerminal } from "lucide-react";
 import Link from "next/link";
 
 import { useNow } from "~/hooks/use-now";
@@ -44,11 +45,39 @@ export function ThreadAffordance({ thread, href }: ThreadAffordanceProps) {
       ) : null}
       {live ? <ThreadStatus status={thread.status} /> : null}
       {!live && turnUnseen(thread) ? <TurnCompleted /> : null}
+      <BackgroundWorkBadge work={thread.backgroundWork} />
       {thread.waitingOn.length > 0 ? (
         <span className="text-muted-foreground truncate text-xs">
           {`on ${thread.waitingOn.map((waiting) => `@${waiting.handle}`).join(", ")}`}
         </span>
       ) : null}
     </Link>
+  );
+}
+
+function BackgroundWorkBadge({ work }: { work: ThreadItem["backgroundWork"] }) {
+  if (work.length === 0) return null;
+  const subagents = work.filter((task) => task.kind === "subagent").length;
+  const processes = work.length - subagents;
+
+  return (
+    <span
+      className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs"
+      title={work.map((task) => task.name).join(", ")}
+    >
+      <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />
+      {subagents > 0 ? (
+        <span className="flex items-center gap-0.5">
+          <Bot size={12} />
+          {subagents === 1 ? "1 subagent" : `${subagents} subagents`}
+        </span>
+      ) : null}
+      {processes > 0 ? (
+        <span className="flex items-center gap-0.5">
+          <SquareTerminal size={12} />
+          {processes === 1 ? "1 process" : `${processes} processes`}
+        </span>
+      ) : null}
+    </span>
   );
 }

@@ -2,7 +2,6 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "@roster/ui";
-import { SquareTerminal } from "lucide-react";
 import { useState } from "react";
 
 import { CountFlash } from "~/components/threads/count-flash";
@@ -15,13 +14,12 @@ import {
 } from "~/utils/live-threads";
 import { trpc } from "~/utils/trpc";
 
-import { useDock } from "./dock-provider";
+import { ChatTabs } from "./chat-tabs";
 
 /*
  * The bar counts across every channel the member can see, not just the one on
  * screen, so it reads the same on Threads and Tasks as it does inside a
- * channel. Clicking it opens the sessions popover; only the Agent button
- * expands the dock, so a click aimed at the counts never moves the layout.
+ * channel. Clicking it opens the sessions popover.
  */
 function OrgCounts({ orgSlug }: { orgSlug: string }) {
   const [cardOpen, setCardOpen] = useState(false);
@@ -33,8 +31,8 @@ function OrgCounts({ orgSlug }: { orgSlug: string }) {
   });
 
   const { data: openFolders } = useQuery({
-    queryKey: ["terminals", "open-folders"],
-    queryFn: () => trpc.terminals.openFolders.query(),
+    queryKey: ["threads", "open-worktrees"],
+    queryFn: () => trpc.threads.openWorktrees.query(),
     refetchInterval: 15_000,
   });
 
@@ -95,27 +93,11 @@ function OrgCounts({ orgSlug }: { orgSlug: string }) {
   );
 }
 
-export function DockStatusBar({ orgSlug }: { orgSlug: string }) {
-  const { mode, toggle } = useDock();
-
+export function AgentStatusBar({ orgSlug }: { orgSlug: string }) {
   return (
-    <footer
-      className={cn(
-        "flex shrink-0 items-center justify-end gap-2",
-        mode === "open" ? "px-1.5 py-1" : "p-2",
-      )}
-    >
+    <footer className="flex shrink-0 items-center justify-end gap-3 py-2 pr-5 pl-2">
+      <ChatTabs />
       <OrgCounts orgSlug={orgSlug} />
-
-      <button
-        type="button"
-        onClick={toggle}
-        aria-label="Toggle agent sessions"
-        className="text-muted-foreground hover:bg-accent hover:text-foreground flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors"
-      >
-        <SquareTerminal size={13} />
-        <span>Agent</span>
-      </button>
     </footer>
   );
 }

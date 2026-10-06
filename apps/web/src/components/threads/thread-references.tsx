@@ -1,6 +1,7 @@
 "use client";
 
 import type {
+  ThreadDetail,
   ThreadFile,
   ThreadLink,
   ThreadPage,
@@ -8,7 +9,6 @@ import type {
   ThreadReferences as References,
 } from "@roster/api";
 import {
-  Button,
   cn,
   Popover,
   PopoverContent,
@@ -21,7 +21,7 @@ import {
   FileText,
   GitPullRequest,
   Image as ImageIcon,
-  LayoutList,
+  ListTree,
   Link2,
   Loader2,
   SquareArrowOutUpRight,
@@ -30,20 +30,33 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 
 import { attachmentKind } from "~/utils/attachments";
+import { threadDetailKey } from "~/utils/thread-rows";
 import { trpc } from "~/utils/trpc";
+
+import { BackgroundWorkGroups, EmptyRow, MenuGroup } from "./thread-background-work";
 
 export interface ThreadReferencesProps {
   projectId: string;
   threadId: string;
+  initialDetail: ThreadDetail;
   className?: string;
 }
 
 export function ThreadReferences({
   projectId,
   threadId,
+  initialDetail,
   className,
 }: ThreadReferencesProps) {
   const [open, setOpen] = useState(false);
+
+  const { data: detail } = useQuery({
+    queryKey: threadDetailKey(threadId),
+    queryFn: () => trpc.threads.get.query({ projectId, threadId }),
+    initialData: initialDetail,
+    enabled: false,
+  });
+  const work = detail.thread.backgroundWork ?? [];
 
   const { data, isError } = useQuery({
     queryKey: ["thread-references", threadId],
@@ -55,32 +68,42 @@ export function ThreadReferences({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="xs"
-          aria-label="Shared in this thread"
-          className={cn("text-muted-foreground !rounded-md", className)}
+        <button
+          type="button"
+          aria-label="Thread activity"
+          title="Background work and what's shared in this thread"
+          className={cn(
+            "border-border/60 bg-grayAlpha-100/60 text-muted-foreground hover:bg-grayAlpha-100 hover:text-foreground flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors",
+            open && "bg-grayAlpha-100 text-foreground",
+            className,
+          )}
         >
-          <LayoutList size={14} />
-        </Button>
+          <ListTree size={14} className="shrink-0" />
+          {work.length > 0 ? (
+            <>
+              <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />
+              <span className="tabular-nums">{work.length}</span>
+            </>
+          ) : null}
+        </button>
       </PopoverTrigger>
 
       <PopoverPortal>
-        <PopoverContent
-          align="end"
-          className="flex max-h-[380px] w-80 flex-col overflow-y-auto p-1.5"
-        >
-          {isError ? (
-            <p className="text-muted-foreground px-2 py-5 text-center text-sm">
-              Could not read this thread.
-            </p>
-          ) : data ? (
-            <ReferenceList references={data} />
-          ) : (
-            <span className="flex items-center justify-center py-6">
-              <Loader2 className="text-muted-foreground size-4 animate-spin" />
-            </span>
-          )}
+        <PopoverContent align="end" sideOffset={6} className="w-80 p-1">
+          <div className="divide-border max-h-[480px] divide-y overflow-y-auto">
+            <BackgroundWorkGroups projectId={projectId} threadId={threadId} work={work} />
+            {isError ? (
+              <MenuGroup title="Shared in this thread">
+                <EmptyRow>Could not read this thread.</EmptyRow>
+              </MenuGroup>
+            ) : data ? (
+              <ReferenceList references={data} />
+            ) : (
+              <span className="flex items-center justify-center py-4">
+                <Loader2 className="text-muted-foreground size-4 animate-spin" />
+              </span>
+            )}
+          </div>
         </PopoverContent>
       </PopoverPortal>
     </Popover>
@@ -94,14 +117,14 @@ function ReferenceList({ references }: { references: References }) {
 
   if (total === 0) {
     return (
-      <p className="text-muted-foreground px-2 py-5 text-center text-sm">
-        Nothing shared in this thread yet.
-      </p>
+      <MenuGroup title="Shared in this thread">
+        <EmptyRow>Nothing shared yet</EmptyRow>
+      </MenuGroup>
     );
   }
 
   return (
-    <div className="flex flex-col gap-3">
+    <>
       <Section heading="Files" count={files.length}>
         {files.map((file) => (
           <FileRow key={file.id} file={file} />
@@ -125,7 +148,7 @@ function ReferenceList({ references }: { references: References }) {
           <LinkRow key={link.href} link={link} />
         ))}
       </Section>
-    </div>
+    </>
   );
 }
 
@@ -141,13 +164,14 @@ function Section({
   if (count === 0) return null;
 
   return (
-    <section className="flex flex-col">
-      <span className="text-muted-foreground flex items-center justify-between px-2 pb-1 text-xs">
-        {heading}
-        <span className="tabular-nums">{count}</span>
-      </span>
+    <MenuGroup
+      title={heading}
+      actions={
+        <span className="text-muted-foreground/70 pr-1 text-[11px] tabular-nums">{count}</span>
+      }
+    >
       {children}
-    </section>
+    </MenuGroup>
   );
 }
 
@@ -168,12 +192,12 @@ function Row({
       target="_blank"
       rel="noreferrer"
       title={detail ? `${label} · ${detail}` : label}
-      className="hover:bg-accent group flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5"
+      className="hover:bg-accent group flex min-w-0 items-center gap-2 rounded-sm px-2 py-1.5"
     >
       <span className="text-muted-foreground flex size-4 shrink-0 items-center justify-center">
         {icon}
       </span>
-      <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
+      <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
       {detail ? (
         <span className="text-muted-foreground max-w-[40%] shrink-0 truncate text-xs">
           {detail}

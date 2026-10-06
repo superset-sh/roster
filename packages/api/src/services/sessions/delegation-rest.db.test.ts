@@ -1,19 +1,10 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@roster/superset", () => ({
+vi.mock("@roster/superset", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@roster/superset")>()),
   createWorkspace: vi.fn(async () => ({ id: "workspace-1" })),
-  runAgent: vi.fn(async () => ({ sessionId: "terminal-1" })),
-  sendToAgent: vi.fn(async () => undefined),
-  interruptAgent: vi.fn(async () => undefined),
   deleteWorkspace: vi.fn(async () => undefined),
-  clearWorkspaceStatuses: vi.fn(async () => undefined),
-  listAgentBindings: vi.fn(async () => []),
-  readTranscript: vi.fn(async () => ({ text: "", source: "harness" })),
-  bindingIsIdle: vi.fn(() => false),
-  isAgentLifecycle: vi.fn(() => false),
-  eventsUrl: vi.fn(() => "http://localhost/events"),
   mintJwt: vi.fn(async () => ({ jwt: "jwt" })),
-  decodeJwtClaims: vi.fn(() => ({})),
 }));
 
 const hasDatabase = Boolean(process.env.DATABASE_URL);

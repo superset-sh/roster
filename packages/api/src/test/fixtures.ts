@@ -192,7 +192,7 @@ export async function makeFixture(name: string): Promise<Fixture> {
           runAsMemberId: memberId,
           status: args.status ?? "running",
           supersetWorkspaceId: "workspace-1",
-          supersetTerminalId: `terminal-${thread!.id}`,
+          supersetChatSessionId: `chat-${thread!.id}`,
           supersetHostKey: "host-1",
         })
         .returning({ id: threadSessions.id });

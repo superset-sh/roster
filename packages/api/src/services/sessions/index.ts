@@ -31,6 +31,7 @@ export {
 } from "./commands";
 export {
   type ChannelThread,
+  countOpenWorktrees,
   type InboxThread,
   joinableThread,
   listChannelThreads,
@@ -45,6 +46,7 @@ export {
   threadReferences,
   threadSummary,
   threadTarget,
+  type ThreadBackgroundWork,
   type ThreadDetail,
   type ThreadPublishState,
   type ThreadSummary,

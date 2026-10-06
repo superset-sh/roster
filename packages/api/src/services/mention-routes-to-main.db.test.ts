@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
+import { waitFor } from "../test/fake-chat";
 import { hasDatabase, makeFixture } from "../test/fixtures";
 import "../test/mock-superset";
 
@@ -37,31 +38,17 @@ async function sessionsIn(threadId: string) {
   return read();
 }
 
-async function startedPrompt(): Promise<string> {
+async function promptsSent(): Promise<string> {
   const superset = await import("@roster/superset");
 
-  const deadline = Date.now() + 8_000;
-  while (Date.now() < deadline) {
-    const prompt = vi.mocked(superset.runAgent).mock.calls[0]?.[0]?.prompt;
-    if (prompt) return prompt;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return "";
-}
-
-async function sentText(): Promise<string> {
-  const superset = await import("@roster/superset");
-
-  const deadline = Date.now() + 8_000;
-  while (Date.now() < deadline) {
-    const said = vi
-      .mocked(superset.sendToAgent)
-      .mock.calls.map((call) => call[0].text)
-      .join("\n");
-    if (said.length > 0) return said;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return "";
+  return waitFor(
+    () =>
+      vi
+        .mocked(superset.promptChat)
+        .mock.calls.map((call) => call[0].text)
+        .join("\n"),
+    (said) => said.length > 0,
+  );
 }
 
 describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
@@ -77,7 +64,7 @@ describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
     const fixture = await makeFixture("mentionmain");
     await fixture.channel("target");
 
-    vi.mocked(superset.runAgent).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     const sent = await messages.sendMessage({
       organizationId: fixture.orgId,
@@ -107,7 +94,7 @@ describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
     await fixture.channel("target");
     await fixture.channel("second");
 
-    vi.mocked(superset.runAgent).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     const sent = await messages.sendMessage({
       organizationId: fixture.orgId,
@@ -122,7 +109,7 @@ describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
     const threadId = await threadFor(sent.id);
     expect(threadId).not.toBeNull();
 
-    const prompt = await startedPrompt();
+    const prompt = await promptsSent();
     expect(prompt).toContain("split the logs between you");
     expect(prompt).toContain("@target and @second");
     expect(prompt).toContain(`roster ask target`);
@@ -139,7 +126,7 @@ describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
     const made = await fixture.thread();
     await fixture.channel("target");
 
-    vi.mocked(superset.sendToAgent).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     await messages.sendMessage({
       organizationId: fixture.orgId,
@@ -152,7 +139,7 @@ describe.skipIf(!hasDatabase())("tagging another agent in a channel", () => {
       threadId: made.threadId,
     });
 
-    const said = await sentText();
+    const said = await promptsSent();
     expect(said).toContain("@target has the logs for this");
     expect(said).toContain("roster ask target");
 

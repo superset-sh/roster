@@ -21,7 +21,6 @@ import { WatchToggle } from "~/components/channels/watch-toggle";
 import { ChannelMark } from "~/components/logo/channel-mark";
 import { MessagePanel } from "~/components/messages/message-panel";
 import { ChannelSearch } from "~/components/search/channel-search";
-import { DockChannelBinding } from "~/components/terminals/dock-provider";
 import { ThreadSidebar } from "~/components/threads/thread-sidebar";
 import { TaskList } from "~/components/tasks/task-list";
 import { loadShell } from "~/lib/shell";
@@ -94,7 +93,6 @@ export default async function ChannelPage({
 
   return (
     <>
-    <DockChannelBinding channelSlug={channel.slug} projectId={channel.id} />
     <AppShell
       shell={shell}
       section="channels"

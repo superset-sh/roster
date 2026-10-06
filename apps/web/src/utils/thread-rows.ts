@@ -1,4 +1,9 @@
-import type { ThreadStatus, ThreadSummary, WaitingOn } from "@roster/api";
+import type {
+  ThreadBackgroundWork,
+  ThreadStatus,
+  ThreadSummary,
+  WaitingOn,
+} from "@roster/api";
 
 export type ThreadItem = Omit<
   ThreadSummary,
@@ -208,7 +213,35 @@ export function parsePublishedThread(data: unknown): ThreadUpdate | null {
       typeof raw.completedByMemberId === "string"
         ? raw.completedByMemberId
         : null,
+    backgroundWork: parseBackgroundWork(raw.backgroundWork),
   };
+}
+
+function parseBackgroundWork(value: unknown): ThreadBackgroundWork[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const raw = entry as Record<string, unknown>;
+    if (
+      typeof raw.rosterSessionId !== "string" ||
+      typeof raw.id !== "string" ||
+      (raw.kind !== "process" && raw.kind !== "subagent") ||
+      typeof raw.name !== "string"
+    ) {
+      return [];
+    }
+    return [
+      {
+        rosterSessionId: raw.rosterSessionId,
+        id: raw.id,
+        kind: raw.kind,
+        name: raw.name,
+        ...(typeof raw.detail === "string" ? { detail: raw.detail } : {}),
+        canStop: raw.canStop === true,
+        startedAtMs: typeof raw.startedAtMs === "number" ? raw.startedAtMs : Date.now(),
+      },
+    ];
+  });
 }
 
 export function mergeThread(

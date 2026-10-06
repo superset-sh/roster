@@ -3,7 +3,7 @@ import { Button } from "@roster/ui";
 import { ChevronLeft, X } from "lucide-react";
 import Link from "next/link";
 
-import { OpenSessionButton } from "~/components/terminals/open-session-button";
+import { OpenChatButton } from "~/components/chat/open-chat-button";
 
 import { CloseOnEscape } from "./close-on-escape";
 import { RecordThreadVisit } from "./record-thread-visit";
@@ -53,8 +53,17 @@ export function ThreadSidebar({
             </Link>
           </Button>
           <h2 className="min-w-0 flex-1 truncate text-base">Thread</h2>
-          <OpenSessionButton projectId={projectId} threadId={threadId} />
-          <ThreadReferences projectId={projectId} threadId={threadId} />
+          <OpenChatButton
+            projectId={projectId}
+            threadId={threadId}
+            channelSlug={channelSlug}
+            title={detail.thread.rootText.split("\n")[0]?.trim() || "Thread"}
+          />
+          <ThreadReferences
+            projectId={projectId}
+            threadId={threadId}
+            initialDetail={detail}
+          />
           <ThreadMenu
             projectId={projectId}
             threadId={threadId}

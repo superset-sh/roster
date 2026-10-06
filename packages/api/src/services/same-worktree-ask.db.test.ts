@@ -1,5 +1,11 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
+import {
+  chatSessionOf,
+  emitAgentMessage,
+  emitTurn,
+  waitFor,
+} from "../test/fake-chat";
 import { hasDatabase, makeFixture } from "../test/fixtures";
 import "../test/mock-superset";
 
@@ -26,7 +32,8 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
     });
 
     vi.mocked(superset.createWorkspace).mockClear();
-    vi.mocked(superset.runAgent).mockClear();
+    vi.mocked(superset.createChatSession).mockClear();
+    vi.mocked(superset.promptChat).mockClear();
 
     const result = await delegations.delegate({
       organizationId: fixture.orgId,
@@ -42,11 +49,12 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
 
     expect(vi.mocked(superset.createWorkspace)).not.toHaveBeenCalled();
 
-    const run = vi.mocked(superset.runAgent).mock.calls[0]?.[0];
-    expect(run?.workspaceId).toBe("workspace-1");
-    expect(run?.prompt).toContain("Own the spec. Ask about scope, not syntax.");
-    expect(run?.prompt).toContain(`You are @${pm.handle}`);
-    expect(run?.prompt).toContain("scope the onboarding change");
+    const opened = vi.mocked(superset.createChatSession).mock.calls[0]?.[0];
+    expect(opened?.workspaceId).toBe("workspace-1");
+    const prompt = vi.mocked(superset.promptChat).mock.calls[0]?.[0].text;
+    expect(prompt).toContain("Own the spec. Ask about scope, not syntax.");
+    expect(prompt).toContain(`You are @${pm.handle}`);
+    expect(prompt).toContain("scope the onboarding change");
 
     const { db, threadSessions } = await import("@roster/db");
     const { eq } = await import("drizzle-orm");
@@ -278,12 +286,22 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
     await startSession({ threadId: parent.threadId, text: "get going" });
 
     const spoken = "I asked @parksaid-pm to scope the onboarding change.";
-    vi.mocked(superset.readTranscript).mockResolvedValue({
-      terminalId: "terminal-1",
-      text: `Assistant: ${spoken}\n`,
-      source: "harness" as const,
-      streamBytes: 0,
-    });
+    const chat = await chatSessionOf(parent.sessionId);
+    const turnId = "turn-handoff";
+    const startedAtMs = Date.now() - 1000;
+    await emitTurn(chat, { id: turnId, status: "running", startedAtMs });
+    await emitAgentMessage(chat, turnId, spoken);
+
+    const { db, messages, threadSessions } = await import("@roster/db");
+    const { and, eq } = await import("drizzle-orm");
+
+    const progressOf = async () =>
+      (
+        await db.query.threadSessions.findFirst({
+          where: eq(threadSessions.id, parent.sessionId),
+        })
+      )?.lastProgress;
+    expect(await waitFor(progressOf, (line) => line === spoken)).toBe(spoken);
 
     await delegations.delegate({
       organizationId: fixture.orgId,
@@ -294,9 +312,6 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
       task: "scope it",
     });
 
-    const { db, messages, threadSessions } = await import("@roster/db");
-    const { and, eq } = await import("drizzle-orm");
-
     const asker = (await db.query.threadSessions.findFirst({
       where: and(
         eq(threadSessions.threadId, parent.threadId),
@@ -305,21 +320,21 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
     }))!;
     expect(asker.status).toBe("waiting");
 
-    const { endTurn } = await import("./sessions/supervisor");
-    await endTurn(
-      {
-        ...asker,
-        organizationId: fixture.orgId,
-        threadProjectId: fixture.projectId,
-        rootMessageId: parent.rootMessageId,
-      } as never,
-      "Stop",
-    );
+    await emitTurn(chat, {
+      id: turnId,
+      status: "completed",
+      startedAtMs,
+      completedAtMs: Date.now(),
+    });
 
-    const written = await db
-      .select({ text: messages.text, author: messages.authorMemberId })
-      .from(messages)
-      .where(eq(messages.threadId, parent.threadId));
+    const written = await waitFor(
+      () =>
+        db
+          .select({ text: messages.text, author: messages.authorMemberId })
+          .from(messages)
+          .where(eq(messages.threadId, parent.threadId)),
+      (rows) => rows.some((row) => row.text === spoken),
+    );
 
     const said = written.find((row) => row.text === spoken);
     expect(said).toBeDefined();
@@ -330,13 +345,6 @@ describe.skipIf(!hasDatabase())("asking an agent on your own folder", () => {
     });
     expect(still?.status).toBe("waiting");
     expect(still?.endedAt).toBeNull();
-
-    vi.mocked(superset.readTranscript).mockResolvedValue({
-      terminalId: "terminal-1",
-      text: "",
-      source: "harness" as const,
-      streamBytes: 0,
-    });
 
     const { reapThread } = await import("./sessions/supervisor");
     await reapThread({ threadId: parent.threadId });
