@@ -45,9 +45,12 @@ export function ThreadMenu({
         <DropdownMenuTrigger asChild>
           <Button
             variant="ghost"
-            size="xs"
             aria-label="Thread actions"
-            className={cn("text-muted-foreground !rounded-md", className)}
+            className={cn(
+              "text-muted-foreground hover:text-foreground !rounded-md px-1.5",
+              menuOpen && "bg-grayAlpha-100 text-foreground",
+              className,
+            )}
           >
             <MoreHorizontal size={14} />
           </Button>
