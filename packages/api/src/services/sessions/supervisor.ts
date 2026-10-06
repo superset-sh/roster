@@ -394,7 +394,9 @@ export async function endTurn(
   });
 }
 
-const AFFIRMATIVE = /^\s*(y|yes|yep|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\s*[.!]?\s*$/i;
+const MAX_EVENT_FAILURES = 3;
+const AFFIRMATIVE = /^\s*(y|yes|yep|yeah|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\b/i;
+const HESITANT = /\b(no|not|don'?t|do not|wait|later|stop|hold|cancel|never)\b/i;
 
 interface ChatWatch {
   sessionId: string;
@@ -404,7 +406,8 @@ interface ChatWatch {
   workspaceId: string;
   chatSessionId: string;
   socket: WebSocket | null;
-  jwt: string | null;
+  failures: number;
+  failedSeq: number | null;
   attempts: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restTimer: ReturnType<typeof setTimeout> | null;
@@ -457,7 +460,8 @@ function startChatWatch(args: {
     workspaceId: args.workspaceId,
     chatSessionId: args.chatSessionId,
     socket: null,
-    jwt: null,
+    failures: 0,
+    failedSeq: null,
     attempts: 0,
     retryTimer: null,
     restTimer: null,
@@ -502,7 +506,6 @@ function connectChatWatch(watch: ChatWatch): void {
       await giveUpChatWatch(watch, auth.problem);
       return;
     }
-    watch.jwt = auth.jwt;
 
     if (watch.cursor) await seedPendingApprovals(watch);
     if (watch.stopped) return;
@@ -555,10 +558,19 @@ function connectChatWatch(watch: ChatWatch): void {
           await handleChatEvent(watch, chatEvent);
         } catch (cause) {
           console.warn(
-            `[sessions] chat event failed for ${watch.sessionId}: ${sessionErrorDetail(cause)}`,
+            `[sessions] chat event ${cursor.seq} failed for ${watch.sessionId}: ${sessionErrorDetail(cause)}`,
           );
-          socket.close();
-          return;
+          watch.failures = watch.failedSeq === cursor.seq ? watch.failures + 1 : 1;
+          watch.failedSeq = cursor.seq;
+          if (watch.failures < MAX_EVENT_FAILURES) {
+            watch.socket = null;
+            socket.close();
+            scheduleChatRetry(watch);
+            return;
+          }
+          console.warn(
+            `[sessions] skipping chat event ${cursor.seq} for ${watch.sessionId} after ${watch.failures} failures`,
+          );
         }
         watch.cursor = cursor;
         await saveChatCursor(watch);
@@ -602,7 +614,7 @@ async function giveUpChatWatch(watch: ChatWatch, reason: string): Promise<void> 
   stopChatWatch(watch.sessionId);
   const session = await sessionById(watch.sessionId);
   if (!session || isTerminal(session.status)) return;
-  if (isIdle(session.status) || isParked(session.status)) {
+  if (isIdle(session.status) || isParked(session.status) || session.status === "needs_input") {
     const row = await patch(watch.sessionId, { backgroundTasks: [] });
     if (row) await publishThread(row.threadId);
     return;
@@ -611,9 +623,12 @@ async function giveUpChatWatch(watch: ChatWatch, reason: string): Promise<void> 
 }
 
 async function latestChatItems(watch: ChatWatch) {
-  if (!watch.jwt) return [];
+  const auth = await jwtForMember({ memberId: watch.memberId, hostKey: watch.hostKey }).catch(
+    () => null,
+  );
+  if (!auth?.jwt) return [];
   const page = await getChatItems({
-    jwt: watch.jwt,
+    jwt: auth.jwt,
     routingKey: watch.hostKey,
     sessionId: watch.chatSessionId,
     limit: 200,
@@ -621,14 +636,17 @@ async function latestChatItems(watch: ChatWatch) {
   if (!page?.ok) return [];
   return page.envelopes.flatMap((envelope) =>
     envelope.event.type === "item"
-      ? [{ item: envelope.event.item, turnId: envelope.event.turnId }]
+      ? [{ item: envelope.event.item, turnId: envelope.event.turnId, cursor: envelope.cursor }]
       : [],
   );
 }
 
 async function seedPendingApprovals(watch: ChatWatch): Promise<void> {
+  const seen = watch.cursor;
+  if (!seen) return;
   const latest = new Map<string, ChatApprovalRequest>();
-  for (const { item } of await latestChatItems(watch)) {
+  for (const { item, cursor } of await latestChatItems(watch)) {
+    if (cursor.epoch !== seen.epoch || cursor.seq > seen.seq) continue;
     if (item.kind === "approval_request") latest.set(item.id, item);
   }
   for (const item of latest.values()) {
@@ -764,7 +782,9 @@ async function handleChatEvent(
     const seen = watch.startedTurns.delete(turn.id);
     const instant = (turn.completedAtMs ?? turn.startedAtMs) <= turn.startedAtMs;
     if (!seen && instant && turn.status === "completed") return;
-    watch.lastReply = watch.replies.get(turn.id) ?? (await recoverReply(watch, turn.id));
+    watch.lastReply =
+      watch.replies.get(turn.id) ??
+      (turn.status === "completed" ? await recoverReply(watch, turn.id) : null);
     watch.replies.delete(turn.id);
     watch.pendingApprovals.clear();
 
@@ -897,7 +917,7 @@ async function answerApprovals(
   const watch = chatWatches.get(session.id);
   if (!watch || watch.pendingApprovals.size === 0) return false;
 
-  const allow = AFFIRMATIVE.test(text);
+  const allow = AFFIRMATIVE.test(text) && !HESITANT.test(text);
   for (const item of [...watch.pendingApprovals.values()]) {
     await respondToChatApproval({
       ...host,
@@ -1834,15 +1854,16 @@ export async function retryThread(args: {
 }
 
 /**
- * A session started before threads ran on chat has no chat to watch. Its turn
- * is over as far as Roster can tell; a reply starts a chat in its worktree.
+ * A session with a worktree but no chat — one started before threads ran on
+ * chat, or one cut off mid-start — has nothing to watch. A reply starts a chat
+ * in its worktree.
  */
 async function strandedTerminalSession(row: SessionView): Promise<void> {
   const parked = await patchLive(row.id, {
     status: "idle",
     endedAt: new Date(),
     lastProgress: null,
-    error: "This session ran in a terminal before Roster moved to chat. Reply to continue it.",
+    error: "This session lost its agent before it could be watched. Reply to continue it.",
   });
   if (parked) await publishThread(parked.threadId);
 }
