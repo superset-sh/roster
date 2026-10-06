@@ -396,6 +396,7 @@ export async function endTurn(
 
 const MAX_EVENT_FAILURES = 3;
 const AFFIRMATIVE = /^\s*(y|yes|yep|yeah|ok|okay|sure|allow|approve|approved|go ahead|do it|proceed)\b/i;
+const BARE_REFUSAL = /^\s*(n|no|nope|nah|deny|decline|reject|cancel|stop|don'?t)\s*[.!]?\s*$/i;
 const HESITANT = /\b(no|not|don'?t|do not|wait|later|stop|hold|cancel|never)\b/i;
 
 interface ChatWatch {
@@ -926,7 +927,7 @@ async function answerApprovals(
       decision: decisionFor(item, allow),
     });
   }
-  return allow;
+  return allow || BARE_REFUSAL.test(text);
 }
 
 async function chatHost(session: SessionView) {
@@ -1474,10 +1475,10 @@ async function startChatSession(args: {
     chatSessionId: created.sessionId,
   });
 
-  await promptChat({ ...host, sessionId: created.sessionId, text: args.prompt });
-
   const running = await patchLive(session.id, { status: "running", error: null });
   if (running) await publishThread(running.threadId);
+
+  await promptChat({ ...host, sessionId: created.sessionId, text: args.prompt });
 
   await drainSteers(session.id);
 }
@@ -1541,9 +1542,9 @@ async function interrupt(args: {
   }
 
   try {
-    await deliverToChat({ session, text: args.text });
-    const row = await patch(args.sessionId, { status: "running", error: null });
+    const row = await patchLive(args.sessionId, { status: "running", error: null });
     if (row) await publishThread(row.threadId);
+    await deliverToChat({ session, text: args.text });
     return true;
   } catch (cause) {
     console.warn(

@@ -282,13 +282,10 @@ function DiffView({
   oldText: string | null;
   newText: string;
 }) {
-  const lines = useMemo(() => {
-    const before = (oldText ?? "").split("\n");
-    const after = newText.split("\n");
-    const removed = before.filter((line) => !after.includes(line)).map((line) => `- ${line}`);
-    const added = after.filter((line) => !before.includes(line)).map((line) => `+ ${line}`);
-    return [...removed, ...added].slice(0, 200);
-  }, [oldText, newText]);
+  const lines = useMemo(
+    () => changedLines((oldText ?? "").split("\n"), newText.split("\n")).slice(0, MAX_DIFF_LINES),
+    [oldText, newText],
+  );
 
   return (
     <div className="bg-grayAlpha-100 overflow-hidden rounded-md">
@@ -395,4 +392,39 @@ function ApprovalRow({
       )}
     </div>
   );
+}
+
+const MAX_DIFF_LINES = 200;
+const MAX_DIFF_CELLS = 250_000;
+
+function changedLines(before: string[], after: string[]): string[] {
+  if (before.length * after.length > MAX_DIFF_CELLS) {
+    return [...before.map((line) => `- ${line}`), ...after.map((line) => `+ ${line}`)];
+  }
+  const common = before.map(() => new Array<number>(after.length + 1).fill(0));
+  common.push(new Array<number>(after.length + 1).fill(0));
+  for (let i = before.length - 1; i >= 0; i -= 1) {
+    for (let j = after.length - 1; j >= 0; j -= 1) {
+      common[i]![j] =
+        before[i] === after[j]
+          ? common[i + 1]![j + 1]! + 1
+          : Math.max(common[i + 1]![j]!, common[i]![j + 1]!);
+    }
+  }
+  const lines: string[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < before.length || j < after.length) {
+    if (i < before.length && j < after.length && before[i] === after[j]) {
+      i += 1;
+      j += 1;
+    } else if (j < after.length && (i >= before.length || common[i]![j + 1]! >= common[i + 1]![j]!)) {
+      lines.push(`+ ${after[j]}`);
+      j += 1;
+    } else {
+      lines.push(`- ${before[i]}`);
+      i += 1;
+    }
+  }
+  return lines;
 }

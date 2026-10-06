@@ -186,6 +186,13 @@ describe.skipIf(!hasDatabase())("a delegated run", () => {
     expect(child?.error).toBeNull();
     expect(child?.status).toBe("running");
 
+    const { jwtForMember } = await import("./sessions/connection");
+    await vi.waitFor(() =>
+      expect(vi.mocked(jwtForMember)).toHaveBeenCalledWith(
+        expect.objectContaining({ memberId: owner.memberId }),
+      ),
+    );
+
     expect(await sessionOf(parent.threadId, fixture.agentFor())).toMatchObject({
       status: "waiting",
     });

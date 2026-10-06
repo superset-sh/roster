@@ -191,10 +191,54 @@ export function parseChatEnvelope(raw: string): ChatEnvelope | null {
   if (typeof value !== "object" || value === null) return null;
   const envelope = value as Record<string, unknown>;
   if (envelope.v !== 1 || typeof envelope.sessionId !== "string") return null;
-  if ("event" in envelope || "delta" in envelope || "reset" in envelope) {
-    return envelope as unknown as ChatEnvelope;
+  if ("event" in envelope) {
+    return isCursor(envelope.cursor) && isDurableEvent(envelope.event)
+      ? (envelope as unknown as ChatEnvelope)
+      : null;
+  }
+  if ("delta" in envelope) {
+    const delta = envelope.delta as Record<string, unknown> | null;
+    return delta && typeof delta.itemId === "string" && typeof delta.append === "string"
+      ? (envelope as unknown as ChatEnvelope)
+      : null;
+  }
+  if ("reset" in envelope) {
+    const reset = envelope.reset as Record<string, unknown> | null;
+    return reset && typeof reset.reason === "string" ? (envelope as unknown as ChatEnvelope) : null;
   }
   return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isCursor(value: unknown): boolean {
+  return isRecord(value) && typeof value.epoch === "string" && typeof value.seq === "number";
+}
+
+function isDurableEvent(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  switch (value.type) {
+    case "item":
+      return (
+        typeof value.turnId === "string" &&
+        isRecord(value.item) &&
+        typeof value.item.id === "string" &&
+        typeof value.item.kind === "string"
+      );
+    case "turn":
+      return (
+        isRecord(value.turn) &&
+        typeof value.turn.id === "string" &&
+        typeof value.turn.status === "string" &&
+        typeof value.turn.startedAtMs === "number"
+      );
+    case "session":
+      return isRecord(value.session) && typeof value.session.status === "string";
+    default:
+      return false;
+  }
 }
 
 export function isDurableChatEnvelope(

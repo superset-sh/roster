@@ -6,12 +6,15 @@ import { ChatPage } from "~/components/chat/chat-page";
 import { CHAT_PAGE_ACTIONS_ID } from "~/components/chat/constants";
 import { loadShell } from "~/lib/shell";
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export default async function ThreadChatPage({
   params,
 }: {
   params: Promise<{ slug: string; channelSlug: string; threadId: string }>;
 }) {
   const { slug, channelSlug, threadId } = await params;
+  if (!UUID.test(threadId)) notFound();
   const { organization, member, shell } = await loadShell(slug);
 
   const channel = await getChannelBySlug({

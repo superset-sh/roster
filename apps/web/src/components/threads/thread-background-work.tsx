@@ -150,7 +150,7 @@ export function BackgroundWorkGroups({
   const { stop, isStopping } = useStopBackgroundWork(projectId, threadId);
   const processes = work.filter((task) => task.kind === "process");
   const subagents = work.filter((task) => task.kind === "subagent");
-  const stoppable = processes.filter((task) => task.canStop);
+  const stoppable = processes.filter((task) => task.canStop && !isStopping(task));
 
   const rows = (tasks: BackgroundWork[]) =>
     tasks.map((task) => (

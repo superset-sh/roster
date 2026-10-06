@@ -138,6 +138,8 @@ export async function stopThreadBackgroundTask(
 ): Promise<boolean> {
   const row = await pickRow(scope);
   if (!row?.chatSessionId) return false;
+  const task = (row.backgroundTasks ?? []).find((candidate) => candidate.id === scope.taskId);
+  if (!task?.canStop) return false;
   const host = await hostFor(row);
   return stopChatBackgroundTask({
     ...host,

@@ -54,6 +54,7 @@ export function ChatComposer({ running, disabled, placeholder, onSend, onStop }:
         value={text}
         disabled={disabled}
         placeholder={placeholder}
+        aria-label="Message the agent"
         onChange={(event) => {
           setText(event.target.value);
           resize();
@@ -77,7 +78,7 @@ export function ChatComposer({ running, disabled, placeholder, onSend, onStop }:
           size="xs"
           aria-label="Send"
           disabled={!canSend}
-          isLoading={sending}
+          isLoading={sending || undefined}
           className={cn("!size-6 !rounded-full p-0", !canSend && "opacity-40")}
           onClick={() => void send()}
         >

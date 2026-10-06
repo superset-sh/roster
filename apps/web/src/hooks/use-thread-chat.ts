@@ -101,7 +101,7 @@ export function useThreadChat(args: {
       setSnapshot((previous) => reduceChat(previous, page.envelopes));
       if (!page.nextBefore) setReachedStart(true);
     } catch {
-      setReachedStart(true);
+      console.warn("[chat] loading older messages failed");
     } finally {
       setLoadingOlder(false);
     }
