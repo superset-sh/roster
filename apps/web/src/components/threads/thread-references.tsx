@@ -9,6 +9,7 @@ import type {
   ThreadReferences as References,
 } from "@roster/api";
 import {
+  Button,
   cn,
   Popover,
   PopoverContent,
@@ -68,12 +69,12 @@ export function ThreadReferences({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button
-          type="button"
+        <Button
+          variant="ghost"
           aria-label="Thread activity"
           title="Background work and what's shared in this thread"
           className={cn(
-            "border-border/60 bg-grayAlpha-100/60 text-muted-foreground hover:bg-grayAlpha-100 hover:text-foreground flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors",
+            "text-muted-foreground hover:text-foreground !rounded-md shrink-0 gap-1.5 px-1.5 text-xs",
             open && "bg-grayAlpha-100 text-foreground",
             className,
           )}
@@ -85,7 +86,7 @@ export function ThreadReferences({
               <span className="tabular-nums">{work.length}</span>
             </>
           ) : null}
-        </button>
+        </Button>
       </PopoverTrigger>
 
       <PopoverPortal>
